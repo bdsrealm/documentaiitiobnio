@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>(function(){try{var t=localStorage.getItem('bd-theme');if(!t){t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}document.documentElement.dataset.theme=t}catch(e){}})()</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anticheat and automod · Bedrock protocol notes</title>
+<meta name="description" content="A worked automod: a second client that joins the realm, scores spam, bots and crash attempts, and bans through operator commands.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="index.html"><span class="mark"></span> bedrock / protocol notes</a>
+  <span class="crumb">§ 10 — <b>Anticheat and automod</b></span>
+  <button class="theme-toggle" id="theme-toggle" type="button" aria-pressed="false">dark</button>
+  <span class="ver">1.26.60 · proto 2225</span>
+</header>
+
+<div class="shell">
+  <nav class="rail">
+    <div class="rail-head">Contents</div>
+    <ol>
+      <li><a href="index.html"><span class="n">01</span> Overview</a></li>
+      <li><a href="packets.html"><span class="n">02</span> Packet reference</a></li>
+      <li><a href="messages.html"><span class="n">03</span> Sending messages</a></li>
+      <li><a href="movement.html"><span class="n">04</span> Movement</a></li>
+      <li><a href="auth.html"><span class="n">05</span> Authentication</a></li>
+      <li><a href="nethernet.html"><span class="n">06</span> NetherNet</a></li>
+      <li><a href="engine.html"><span class="n">07</span> bedrockx engine</a></li>
+      <li><a href="rewrite.html"><span class="n">08</span> Rewriting the client</a></li>
+      <li><a href="exploits.html"><span class="n">09</span> Exploits and abuse</a></li>
+      <li><a href="automod.html" class="active"><span class="n">10</span> Anticheat and automod</a></li>
+    </ol>
+    <div class="rail-note">
+      Realms has no plugins. The moderation layer is another client, holding operator
+      and reading the same packet stream this bot already decodes.
+    </div>
+  </nav>
+
+  <main>
+
+    <section class="hero">
+      <p class="eyebrow">Chapter ten</p>
+      <h1>Anticheat and automod</h1>
+      <p class="lede">
+        A realm cannot run a plugin, but it can hold a second player. That player decodes the
+        same packets, keeps a score per identity, and enforces through the commands an operator
+        already has: <code>/kick</code> and <code>/ban</code>. This chapter builds one end to end.
+      </p>
+    </section>
+
+    <div class="warn">
+      <p>
+        An automod with operator is a loaded gun pointed at your own member list. Run it in
+        <code>--dry</code> first, keep an audit log, and only give it an account you control on a
+        realm you own. Never point it at someone else's world.
+      </p>
+    </div>
+
+    <h2 id="shape"><span class="n">10.1</span> The shape of the thing</h2>
+
+    <p>
+      Everything here is one long-lived client with four jobs:
+      <b>join</b> like any player, <b>read</b> what the realm broadcasts, <b>score</b> each identity
+      over time, and <b>act</b> through operator commands. There is no server hook to install and no
+      privileged socket — the automod sees exactly what a normal member sees.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Job</th><th>Uses</th><th>From</th></tr></thead>
+        <tbody>
+          <tr><td>Join</td><td>auth flow, realm resolve, NetherNet / RakNet connect</td><td><code>src/bot.js</code>, <code>src/engine/</code></td></tr>
+          <tr><td>Read</td><td><code>text</code>, <code>player_list</code>, <code>add_player</code>, <code>move_player</code>, <code>animate</code>, <code>entity_event</code>, <code>block_actor_data</code></td><td>the engine's packet events</td></tr>
+          <tr><td>Score</td><td>per-identity weights, decay, thresholds</td><td>this chapter</td></tr>
+          <tr><td>Act</td><td><code>command_request</code> as <code>/kick</code> / <code>/ban</code></td><td><code>engine.command()</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Because the client already installs the inbound guard from
+      <a href="exploits.html">chapter 9</a>, the automod's listeners never see a NaN position, a
+      4 000-newline text or a 200 kB NBT blob — those are dropped upstream of <code>emit</code>.
+      That is deliberate: the moderator bot should not be crashable by the thing it moderates.
+      The trade-off is that it also cannot report every crash attempt, so the guard's counters
+      (the <code>anticrash:</code> line of <code>status</code>) are the other half of the picture.
+    </p>
+
+    <h2 id="account"><span class="n">10.2</span> The account, the invite, the op</h2>
+
+    <ol class="steps">
+      <li><b>Dedicated account.</b> Not your main. It needs its own Microsoft account, its own
+        <code>profiles/</code> cache entry, and its own gamertag — members will see it in the list
+        and it should read as staff.</li>
+      <li><b>Join the realm.</b> Invite it from the realm's member screen, or accept an invite
+        link. The bot resolves the invite to a NetherNet address exactly as chapter 6 describes.</li>
+      <li><b>Get operator.</b> The realm owner runs <code>/op &lt;botname&gt;</code> in game (or
+        toggles Operator on the member in Realm settings). No packet the bot can send replaces
+        this — permission is granted by the owner, not claimed by the client.</li>
+      <li><b>Verify.</b> <code>await bot.engine.command('/list')</code> should answer with the
+        player list. If it answers <code>unknown command</code> or nothing, the op did not land
+        and <code>/ban</code> will silently fail too.</li>
+    </ol>
+
+    <div class="note">
+      <p>
+        A second account is also a second <em>member slot</em>. On a 10-player realm the automod
+        permanently occupies one, and on a full realm it cannot join at all. Check
+        <code>maxPlayers</code> before designing around it.
+      </p>
+    </div>
+
+    <h2 id="wiring"><span class="n">10.3</span> Wiring into the stream</h2>
+
+    <p>
+      The bot object exposes the live client as <code>bot.engine.client</code> once it has
+      spawned. Attach listeners there — after <code>connect()</code>, before you need them.
+    </p>
+
+    <pre><code>const { Bot } = require('./src/bot')
+const { createAuthflow, authenticate } = require('./src/auth')
+const { makeBxAuthflow } = require('./src/engine/bedrockx')
+
+const flow = createAuthflow(cfg.account)
+const bxFlow = makeBxAuthflow(cfg.account, (code) =&gt; {
+  console.log(`sign in: ${code.verification_uri} — ${code.user_code}`)
+})
+
+const bot = new Bot(cfg, flow, bxFlow)
+bot.profile = await authenticate(flow)
+await bot.connect()                       // uses cfg.realm
+
+const client = bot.engine.client          // packet events live here
+const selfId = bot.engine.runtimeId       // never score yourself
+
+client.on('text', onText)
+client.on('player_list', onPlayerList)
+client.on('move_player', onMovePlayer)
+client.on('animate', onAnimate)
+client.on('entity_event', onEntityEvent)
+client.on('block_actor_data', onNbt)</code></pre>
+
+    <p class="small muted">
+      Sending is symmetrical: <code>bot.say()</code> for chat, and
+      <code>bot.engine.command('/kick …')</code> which resolves with the command's output text —
+      the only reliable way to know the ban actually happened.
+    </p>
+
+    <h2 id="identity"><span class="n">10.4</span> Who you are scoring</h2>
+
+    <p>
+      Bots rotate names, so the key matters more than the label. Three identifiers appear in the
+      stream, and they are not equally trustworthy:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Key</th><th>Comes from</th><th>Stability</th><th>Use it for</th></tr></thead>
+        <tbody>
+          <tr><td><code>xuid</code></td><td><code>text.xuid</code>, <code>player_list.xbox_user_id</code></td><td>stable per account</td><td>scores, bans, evidence</td></tr>
+          <tr><td><code>uuid</code></td><td><code>player_list</code> records, <code>add_player.uuid</code></td><td>stable per account</td><td>correlating list ↔ entity</td></tr>
+          <tr><td><code>runtime_id</code></td><td><code>add_player</code>, <code>move_player</code>, <code>animate</code></td><td>per session only</td><td>movement gait, not bans</td></tr>
+          <tr><td><code>source_name</code></td><td><code>text</code></td><td>mutable, spoofable</td><td>display and fallback only</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      A ban command takes the <em>name</em>, because that is what the server resolves. So keep a
+      map from xuid to the last name you saw, and ban by the name while the record is fresh — a
+      bot that leaves and renames is a different ban target anyway.
+    </p>
+
+    <h2 id="signals"><span class="n">10.5</span> What is worth detecting</h2>
+
+    <p>
+      The bot in this repo already has a detector worth copying: <code>botdet</code> counts packets
+      per entity per second, flags rate anomalies, and pattern-matches the spam families it has
+      seen — <code>/me</code> floods, <code>/tell</code> loops, and the <code>* External</code>
+      prefix relay bots use when they echo another realm's chat. Its thresholds are the starting
+      point below.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Family</th><th>Signal</th><th>Default trigger</th></tr></thead>
+        <tbody>
+          <tr><td>Chat flood</td><td>messages per source</td><td>&gt; 5/s</td></tr>
+          <tr><td>Relay spam</td><td><code>/^\\s*\\*?\\s*External\\b/</code></td><td>3 in 10 s</td></tr>
+          <tr><td><code>/me</code> spam</td><td><code>/me</code> or <code>* name text</code></td><td>3 in 10 s</td></tr>
+          <tr><td>Repeat spam</td><td>same normalised message</td><td>4 identical in 30 s</td></tr>
+          <tr><td>Text bomb</td><td>newlines or <code>U+F8FF</code> wall</td><td>any (guard drops most)</td></tr>
+          <tr><td>Animation spam</td><td><code>animate</code> per entity</td><td>&gt; 20/s</td></tr>
+          <tr><td>Movement spam</td><td><code>move_player</code> per entity</td><td>&gt; 50/s</td></tr>
+          <tr><td>Command spam</td><td><code>command_request</code> per origin</td><td>&gt; 5/s</td></tr>
+          <tr><td>Event spam</td><td><code>entity_event</code> per entity</td><td>&gt; 30/s</td></tr>
+          <tr><td>NBT bomb</td><td><code>block_actor_data.nbt</code></td><td>&gt; 100 000 JSON chars</td></tr>
+          <tr><td>Bad floats</td><td>NaN / ∞ in position or rotation</td><td>any</td></tr>
+          <tr><td>Bot gait</td><td>constant speed, no yaw change, exact 20 Hz</td><td>20 samples, σ &lt; 0.01</td></tr>
+          <tr><td>Join burst</td><td>new members in <code>player_list</code></td><td>&gt; 3 in 5 s</td></tr>
+          <tr><td>Guest / no-chat cluster</td><td>new joins that never speak</td><td>2 + shared signature</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <p>
+        <b>Bot gait</b> is the most reliable antibot signal available to a client, and the least
+        certain. A scripted walker holds a fixed speed, never changes yaw, never jumps, and sends
+        one move per tick. Measure the standard deviation of horizontal step length over ~20
+        packets; a human's is never that flat. Two flat walkers joining together is the pattern
+        worth acting on — one is probably a person on autopilot.
+      </p>
+    </div>
+
+    <h2 id="scoring"><span class="n">10.6</span> Score, decay, enforce</h2>
+
+    <p>
+      Never act on a single packet. Add weight, decay it, and act on thresholds — that is what
+      keeps a lag spike from banning someone.
+    </p>
+
+    <pre><code>const WEIGHT = {
+  chatRate: 3, repeat: 2, relaySpam: 2, meSpam: 3,
+  animate: 2, moveRate: 2, commandRate: 4, eventRate: 3,
+  nbtBomb: 10, textBomb: 10, badFloat: 10,
+  botGait: 3, joinBurst: 5
+}
+const LIMIT = { kick: 12, ban: 24, decayPerMinute: 1 }</code></pre>
+
+    <p>
+      Then the ladder: <b>0–11</b> watch, <b>12+</b> kick, <b>24+</b> ban. Warn once at 6 so a
+      person who is just loud gets a message before anything happens to them, and always prefer a
+      kick to a ban when the evidence is behavioural rather than mechanical.
+    </p>
+
+    <h2 id="full"><span class="n">10.7</span> The full automod</h2>
+
+    <p>
+      One file, no dependencies beyond this repo. Save as <code>automod.js</code> next to
+      <code>config.json</code>, run with <code>REALM=&lt;invite|id&gt; node automod.js --dry</code>
+      until the log looks sane, then drop <code>--dry</code>.
+    </p>
+
+    <pre><code>'use strict'
+// automod.js — a second client in the realm that scores and bans.
+//   REALM=&lt;invite|id&gt; node automod.js [--dry]
+
+const fs = require('fs')
+const path = require('path')
+const crypto = require('crypto')
+const { Bot } = require('./src/bot')
+const { createAuthflow, authenticate } = require('./src/auth')
+const { makeBxAuthflow } = require('./src/engine/bedrockx')
+
+const DRY = process.argv.includes('--dry')
+const AUDIT = path.join(__dirname, 'automod-audit.jsonl')
+
+const W = {
+  chatRate: 3, repeat: 2, relay: 2, me: 3, animate: 2, moveRate: 2,
+  commandRate: 4, event: 3, nbt: 10, textBomb: 10, badFloat: 10,
+  gait: 3, joinBurst: 5
+}
+const T = { kick: 12, ban: 24, decay: 1 }
+
+/* ── state ─────────────────────────────────────────────────────────── */
+const scores = new Map()      // xuid|name -> { score, name, reasons, last }
+const buckets = new Map()     // key -> { count, start }
+const lastMsg = new Map()     // name -> [{ hash, ts }]
+const gait = new Map()        // runtime_id -> [step lengths]
+const joins = []              // { name, ts }
+const actedAt = new Map()     // name -> ms of last action
+
+function who (p) {
+  return { name: p.source_name || p.username || 'unknown', xuid: p.xuid || p.xbox_user_id || '' }
+}
+function keyOf (w) { return w.xuid || w.name }
+
+function bump (w, weight, reason) {
+  const k = keyOf(w)
+  const s = scores.get(k) || { score: 0, name: w.name, reasons: [], last: Date.now() }
+  s.score += weight
+  s.name = w.name !== 'unknown' ? w.name : s.name
+  s.reasons.push(reason)
+  if (s.reasons.length &gt; 24) s.reasons.shift()
+  s.last = Date.now()
+  scores.set(k, s)
+  return s
+}
+
+function rate (key, windowMs, limit) {
+  const now = Date.now()
+  const b = buckets.get(key)
+  if (!b || now - b.start &gt; windowMs) { buckets.set(key, { count: 1, start: now }); return false }
+  b.count++
+  return b.count &gt; limit
+}
+
+function hash (s) { return crypto.createHash('sha1').update(s).digest('hex').slice(0, 12) }
+
+/* ── enforcement ───────────────────────────────────────────────────── */
+async function act (s, why) {
+  const ban = s.score &gt;= T.ban
+  const cmd = ban ? `/ban "${s.name}"` : `/kick "${s.name}" automod: ${why}`
+  const line = { ts: new Date().toISOString(), name: s.name, score: s.score, why, cmd }
+
+  if (DRY) {
+    console.log('[dry]', line.ts, s.name, s.score, '→', cmd)
+    return
+  }
+  const last = actedAt.get(s.name) || 0
+  if (Date.now() - last &lt; 60_000) return
+  actedAt.set(s.name, Date.now())
+
+  try {
+    line.output = await bot.engine.command(cmd)
+  } catch (err) {
+    line.output = 'error: ' + err.message
+  }
+  fs.appendFileSync(AUDIT, JSON.stringify(line) + '\n')
+  console.log('[automod]', line.ts, s.name, s.score, '→', cmd, '|', line.output)
+  await bot.say(`[automod] ${s.name} ${ban ? 'banned' : 'kicked'} (score ${s.score})`)
+}
+
+/* ── packet handlers ───────────────────────────────────────────────── */
+function onText (p) {
+  const msg = String(p.message || '')
+  const w = who(p)
+  if (!p.xuid &amp;&amp; !p.source_name) return          // system / server line
+
+  if (/\uF8FF{8,}|\n{8,}/.test(msg)) bump(w, W.textBomb, 'text bomb')
+  if (/^\s*\*?\s*External\b/i.test(msg)) bump(w, W.relay, 'relay spam')
+  if (/^\s*\/me\b/i.test(msg) || /^\s*\*\s*\S+\s+/.test(msg)) bump(w, W.me, '/me spam')
+
+  if (rate('chat:' + keyOf(w), 1000, 5)) bump(w, W.chatRate, 'chat rate')
+
+  const h = hash(msg.replace(/\s+/g, ' ').trim().toLowerCase())
+  const hist = (lastMsg.get(w.name) || []).filter((x) =&gt; Date.now() - x.ts &lt; 30_000)
+  hist.push({ hash: h, ts: Date.now() })
+  lastMsg.set(w.name, hist.slice(-8))
+  if (hist.filter((x) =&gt; x.hash === h).length &gt;= 4) bump(w, W.repeat, 'repeat spam')
+
+  const s = scores.get(keyOf(w))
+  if (s &amp;&amp; s.score &gt;= T.kick) act(s, s.reasons.slice(-3).join(', '))
+}
+
+function onPlayerList (p) {
+  const records = p.records?.records || p.entries || p.records || []
+  const now = Date.now()
+  const names = new Set(records.map((r) =&gt; r.username).filter(Boolean))
+  const fresh = [...names].filter((n) =&gt; !joins.some((j) =&gt; j.name === n &amp;&amp; now - j.ts &lt; 120_000))
+  for (const n of fresh) joins.push({ name: n, ts: now })
+  if (joins.length &gt; 200) joins.splice(0, joins.length - 200)
+
+  const recent = joins.filter((j) =&gt; now - j.ts &lt; 5_000)
+  if (recent.length &gt; 3) for (const j of recent) bump({ name: j.name }, W.joinBurst, 'join burst')
+
+  for (const n of fresh) {
+    if (/^[A-Za-z]{4,}\d{3,}$/.test(n) || /^[a-z]{6,}[0-9]{2}$/i.test(n)) {
+      bump({ name: n }, 1, 'scripted name')
+    }
+  }
+}
+
+function onMovePlayer (p) {
+  const id = p.runtime_id ?? p.runtime_entity_id
+  if (id === undefined || id === selfId) return
+  const pos = p.position
+  if (!pos) return
+  if ([pos.x, pos.y, pos.z].some((v) =&gt; typeof v !== 'number' || !isFinite(v))) {
+    const name = bot.entities.get(String(id))?.name || `rtid_${id}`
+    bump({ name }, W.badFloat, 'bad floats')
+    return
+  }
+
+  const prev = gait.get(id) || { last: null, steps: [] }
+  if (prev.last) {
+    const dx = pos.x - prev.last.x, dz = pos.z - prev.last.z
+    prev.steps.push(Math.hypot(dx, dz))
+    if (prev.steps.length &gt; 24) prev.steps.shift()
+  }
+  prev.last = { x: pos.x, z: pos.z }
+  gait.set(id, prev)
+
+  if (prev.steps.length === 20) {
+    const mean = prev.steps.reduce((a, b) =&gt; a + b, 0) / prev.steps.length
+    const sd = Math.sqrt(prev.steps.reduce((a, b) =&gt; a + (b - mean) ** 2, 0) / prev.steps.length)
+    const name = bot.entities.get(String(id))?.name || `rtid_${id}`
+    if (mean &gt; 0.05 &amp;&amp; sd &lt; 0.01) bump({ name }, W.gait, 'bot gait')
+  }
+
+  if (rate('move:' + id, 1000, 50)) {
+    bump({ name: bot.entities.get(String(id))?.name || `rtid_${id}` }, W.moveRate, 'move rate')
+  }
+}
+
+function onAnimate (p) {
+  const id = p.runtime_entity_id ?? p.runtime_id
+  if (id === undefined || id === selfId) return
+  if (rate('animate:' + id, 1000, 20)) {
+    bump({ name: bot.entities.get(String(id))?.name || `rtid_${id}` }, W.animate, 'animate spam')
+  }
+}
+
+function onEvent (p) {
+  const id = p.runtime_entity_id ?? p.runtime_id
+  if (id === undefined || id === selfId) return
+  if (rate('event:' + id, 1000, 30)) {
+    bump({ name: bot.entities.get(String(id))?.name || `rtid_${id}` }, W.event, 'event spam')
+  }
+}
+
+function onNbt (p) {
+  if (!p.nbt) return
+  let size = 0
+  try { size = JSON.stringify(p.nbt).length } catch { size = 1e9 }
+  if (size &gt; 100_000) bump(who(p), W.nbt, 'nbt bomb')
+}
+
+/* ── decay loop ────────────────────────────────────────────────────── */
+setInterval(() =&gt; {
+  const now = Date.now()
+  for (const [k, b] of buckets) if (now - b.start &gt; 120_000) buckets.delete(k)
+  for (const [k, s] of scores) {
+    const mins = Math.floor((now - s.last) / 60_000)
+    if (mins &gt;= 1) { s.score = Math.max(0, s.score - mins * T.decay); s.last = now }
+    if (s.score === 0) scores.delete(k)
+  }
+}, 15_000)
+
+/* ── boot ──────────────────────────────────────────────────────────── */
+let bot, selfId
+
+;(async () =&gt; {
+  const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'))
+  cfg.realm = process.env.REALM || cfg.realm
+  cfg.account = cfg.account || {}
+  cfg.account.profilesFolder = path.resolve(__dirname, cfg.account.profilesFolder || './profiles')
+
+  const flow = createAuthflow(cfg.account)
+  const bxFlow = makeBxAuthflow(cfg.account, (c) =&gt; console.log(`sign in: ${c.verification_uri} ${c.user_code}`))
+
+  bot = new Bot(cfg, flow, bxFlow)
+  bot.profile = await authenticate(flow)
+  await bot.connect()
+
+  const client = bot.engine.client
+  selfId = bot.engine.runtimeId
+  client.on('text', onText)
+  client.on('player_list', onPlayerList)
+  client.on('move_player', onMovePlayer)
+  client.on('animate', onAnimate)
+  client.on('entity_event', onEvent)
+  client.on('block_actor_data', onNbt)
+
+  console.log(`automod online as ${cfg.account.username}${DRY ? ' (dry run)' : ''}`)
+  await bot.engine.command('/list')
+})().catch((err) =&gt; {
+  console.error('automod failed to start:', err?.message || err)
+  process.exit(1)
+})</code></pre>
+
+    <p class="small muted">
+      <code>bot.entities</code> is the bot's own runtime-id → player map, maintained by its
+      <code>add_player</code> / <code>player_list</code> listeners. It is how a <code>move_player</code>
+      packet becomes a name you can ban.
+    </p>
+
+    <h2 id="deploy"><span class="n">10.8</span> Getting it operational</h2>
+
+    <ol class="steps">
+      <li><b>Dry run for a day.</b> <code>--dry</code> prints the action it would take and writes
+        nothing. Read the log: if a real member is sitting at 15 points, your weights are wrong,
+        not the member.</li>
+      <li><b>Staff account hygiene.</b> The automod's token lives in <code>profiles/</code> next to
+        any other account's. Treat that folder like a password store; never commit it.</li>
+      <li><b>Supervise the process.</b> A moderation bot that dies quietly is worse than none —
+        run it under a supervisor with the same reconnect backoff the bot already implements, and
+        alarm if it has been offline for more than a minute.</li>
+      <li><b>Keep the audit file.</b> Every action appends one JSON line: time, name, score,
+        command, output. It is the only thing that settles "why was I banned".</li>
+      <li><b>Two operators.</b> If the automod is the only op, a false positive can lock the owner
+        out of their own realm. Keep a human op as a break-glass.</li>
+    </ol>
+
+    <h2 id="limits"><span class="n">10.9</span> What it cannot do</h2>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Limitation</th><th>Why</th><th>Where it belongs instead</th></tr></thead>
+        <tbody>
+          <tr><td>Stop a pre-join flood</td><td>It only sees the realm after it is inside</td><td>host-side handshake and connection caps</td></tr>
+          <tr><td>Ban an IP</td><td>Realm commands take names, not addresses</td><td>server ACLs; on Realms, report and rotate the invite</td></tr>
+          <tr><td>Delete spam already sent</td><td>Chat has no retraction packet</td><td>prevention — kick before it repeats</td></tr>
+          <tr><td>See whispers to other players</td><td>The realm only broadcasts what it chooses</td><td>nothing; accept the blind spot</td></tr>
+          <tr><td>Stop a determined multi-account attacker</td><td>Each new account starts at zero score</td><td>join-signature clustering plus manual invites</td></tr>
+          <tr><td>Protect itself from a hostile server</td><td>It is a client</td><td>the inbound guard, <a href="exploits.html">§ 9.10</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The honest summary: an automod is a behavioural filter with a ban command attached. It is
+      excellent against the 90% of abuse that is lazy and repetitive, and useless against a patient
+      human who types slowly. Design it to escalate to a human, not to replace one.
+    </p>
+
+  </main>
+</div>
+
+<footer>
+  <span>§ 10 anticheat and automod</span>
+  <span class="spacer"></span>
+  <a href="exploits.html">exploits</a>
+  <a href="engine.html">engine</a>
+  <a href="index.html">contents ↑</a>
+</footer>
+
+<script src="assets/protocol-data.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

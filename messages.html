@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>(function(){try{var t=localStorage.getItem('bd-theme');if(!t){t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}document.documentElement.dataset.theme=t}catch(e){}})()</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sending messages · Bedrock protocol notes</title>
+<meta name="description" content="How Bedrock chat is sent: the text packet, /me through command origins, external delivery, and the message floods this bot implements.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="index.html"><span class="mark"></span> bedrock / protocol notes</a>
+  <span class="crumb">§ 03 — <b>Sending messages</b></span>
+  <button class="theme-toggle" id="theme-toggle" type="button" aria-pressed="false">dark</button>
+  <span class="ver">1.26.60 · proto 2225</span>
+</header>
+
+<div class="shell">
+  <nav class="rail">
+    <div class="rail-head">Contents</div>
+    <ol>
+      <li><a href="index.html"><span class="n">01</span> Overview</a></li>
+      <li><a href="packets.html"><span class="n">02</span> Packet reference</a></li>
+      <li><a href="messages.html" class="active"><span class="n">03</span> Sending messages</a></li>
+      <li><a href="movement.html"><span class="n">04</span> Movement</a></li>
+      <li><a href="auth.html"><span class="n">05</span> Authentication</a></li>
+      <li><a href="nethernet.html"><span class="n">06</span> NetherNet</a></li>
+      <li><a href="engine.html"><span class="n">07</span> bedrockx engine</a></li>
+      <li><a href="rewrite.html"><span class="n">08</span> Rewriting the client</a></li>
+      <li><a href="exploits.html"><span class="n">09</span> Exploits and abuse</a></li>
+      <li><a href="automod.html"><span class="n">10</span> Anticheat and automod</a></li>
+    </ol>
+    <div class="rail-note">
+      Chat is the easiest way to prove a client works: one packet, immediate feedback,
+      and the server echoes it back to you.
+    </div>
+  </nav>
+
+  <main>
+
+    <section class="hero">
+      <p class="eyebrow">Chapter three</p>
+      <h1>Sending messages</h1>
+      <p class="lede">
+        Two routes produce visible text: the <code>text</code> packet, which is you talking,
+        and <code>command_request</code>, which is you asking the server to run something —
+        including <code>/me</code>, which is how an unattributed line gets into chat.
+      </p>
+    </section>
+
+    <h2 id="text"><span class="n">3.1</span> The text packet</h2>
+
+    <p>
+      One packet carries every kind of chat line Bedrock has. Its shape is
+      <code>needs_translation</code>, a <code>category</code>, a <code>type</code>, a body that depends on
+      the type, then the sender identity fields.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>needs_translation</code></td><td>bool</td><td><code>false</code> for raw chat; <code>true</code> only for translation keys.</td></tr>
+          <tr><td><code>category</code></td><td><code>mapper&lt;u8&gt;</code></td>
+            <td><code>message_only</code> 0 · <code>authored</code> 1 · <code>parameters</code> 2</td></tr>
+          <tr><td><code>type</code></td><td><code>mapper&lt;u8&gt;</code></td>
+            <td><code>raw</code> 0 · <code>chat</code> 1 · <code>translation</code> 2 · <code>popup</code> 3 ·
+              <code>jukebox_popup</code> 4 · <code>tip</code> 5 · <code>system</code> 6 ·
+              <code>whisper</code> 7 · <code>announcement</code> 8 · <code>json_whisper</code> 9 ·
+              <code>json</code> 10 · <code>json_announcement</code> 11</td></tr>
+          <tr><td>body</td><td>switch on <code>type</code></td>
+            <td><code>chat</code>/<code>whisper</code>/<code>announcement</code> take
+              <code>source_name</code> + <code>message</code>; <code>raw</code>/<code>tip</code>/<code>system</code>/<code>json*</code>
+              take <code>message</code> only; <code>translation</code>/<code>popup</code> take
+              <code>message</code> + a <code>string[]varint</code> of parameters.</td></tr>
+          <tr><td><code>xuid</code></td><td>string</td><td>The sender's Xbox id; empty works, but clients send it.</td></tr>
+          <tr><td><code>platform_chat_id</code></td><td>string</td><td>Empty for normal chat.</td></tr>
+          <tr><td><code>filtered_message</code></td><td>string</td><td>Present even when empty; the client always writes it.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <p>
+        The full field tree, including the switch cases, is on
+        <a href="packets.html#packet/text">the reference page for <code>text</code></a>.
+        The packet page is generated; this section explains which values you actually want.
+      </p>
+    </div>
+
+    <h2 id="say"><span class="n">3.2</span> A plain chat line</h2>
+
+    <p>
+      <code>say</code> in the console reaches the engine's <code>say()</code>, which writes a
+      single <code>text</code> packet of type <code>chat</code>. Note that <code>source_name</code>
+      is filled in but the server is free to replace it with your gamertag.
+    </p>
+
+    <div class="code-head">src/engine/bedrockx.js — say() <span class="spacer"></span></div>
+    <pre><code>say (message) {
+  this.client.write('text', {
+    needs_translation: false,
+    category: 'authored',
+    type: 'chat',
+    source_name: this.bot.profile?.name || 'bot',
+    message,
+    xuid: this.bot.profile?.xuid || '',
+    platform_chat_id: '',
+    has_filtered_message: false,
+    filtered_message: ''
+  })
+}</code></pre>
+
+    <p class="small muted">
+      If your encoder rejects the call, the error is printed by
+      <code>connection.js</code> rather than thrown at the caller — check the console, not a
+      try/catch around the write.
+    </p>
+
+    <h2 id="me"><span class="n">3.3</span> /me, and why it looks different</h2>
+
+    <p>
+      <code>/me</code> is not text — it is a command. Asking the server to run it produces a
+      chat line with <em>no</em> sender name attached, and the realm decides what to put there.
+      The <code>origin</code> object is what it decides from:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th><code>origin.type</code></th><th>Chat shows</th><th>Typical use</th></tr></thead>
+        <tbody>
+          <tr><td><code>player</code></td><td>your gamertag, normal command attribution</td><td>commands that should look like the account ran them</td></tr>
+          <tr><td><code>automationplayer</code></td><td><code>* External &lt;text&gt;</code> — no nametag, no xuid</td><td><code>/me</code> floods, display text</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <pre><code>// what engine.externalCommandRandom() writes, once per send
+client.write('command_request', {
+  command: '/me ' + message,
+  origin: {
+    type: 'automationplayer',
+    uuid: randomUUID(),        // fresh per send
+    request_id: randomUUID(),  // fresh per send
+    player_entity_id: this.runtimeId ?? 0n
+  },
+  internal: false,             // true keeps it server-side, no chat line
+  version: 'latest'
+})</code></pre>
+
+    <div class="note">
+      <p>
+        <code>internal: true</code> is the difference between "the server ran this quietly" and
+        "everyone saw it". Every flood in this project sends <code>false</code>, because the
+        point is the visible line.
+      </p>
+    </div>
+
+    <h2 id="commands"><span class="n">3.4</span> Reading command output</h2>
+
+    <p>
+      The server answers with <code>command_output</code>. It echoes the
+      <code>origin.request_id</code> you sent, which is how you match a reply to a request when
+      several are in flight:
+    </p>
+
+    <pre><code>const requestId = Math.floor(Math.random() * 1e9).toString()
+
+client.on('command_output', (packet) =&gt; {
+  if (packet.origin?.request_id !== requestId) return   // someone else's answer
+  // packet.output[]  → [{ message_id, parameters[] }]
+  // packet.has_data  → true when the command returned free text
+})
+
+client.write('command_request', {
+  command: '/list',
+  origin: { type: 'player', uuid: randomUUID(), request_id: requestId, player_entity_id: 0n },
+  internal: false,
+  version: 'latest'
+})</code></pre>
+
+    <p class="small muted">
+      Some commands legitimately return nothing (<code>/say</code> is the usual example). The
+      engine treats a 10-second silence as "(no output — command was sent)" rather than an error.
+    </p>
+
+    <h2 id="loops"><span class="n">3.5</span> Message loops</h2>
+
+    <p>
+      Three commands send repeatedly, and each exists because it behaves differently on the
+      receiving end:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Command</th><th>Packet</th><th>Cadence</th><th>Line</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>spam [realm] &lt;msg&gt; on</code></td>
+            <td><code>command_request</code>, automation origin</td>
+            <td>1 per 50 ms, starting 5–8 s after the join, never before <code>spawned</code></td>
+            <td><code>/me &lt;msg&gt; | §…signature - §0&lt;6-char code&gt;</code></td>
+          </tr>
+          <tr>
+            <td><code>break &lt;realm&gt; &lt;secs&gt; on</code></td>
+            <td><code>command_request</code></td>
+            <td>1 per 25 ms for the given duration</td>
+            <td>external <code>/me</code> wall</td>
+          </tr>
+          <tr>
+            <td><code>admessage &lt;realm&gt; &lt;secs&gt; on</code></td>
+            <td><code>command_request</code></td>
+            <td>1 per 25 ms</td>
+            <td>plain text, no <code>§</code> codes at all</td>
+          </tr>
+          <tr>
+            <td><code>lag &lt;realm&gt; &lt;player&gt; on</code></td>
+            <td><code>command_request</code></td>
+            <td>fast loop</td>
+            <td><code>/tell &lt;player&gt; …</code> — a whisper, not public chat</td>
+          </tr>
+          <tr>
+            <td><code>mafter [realm] [msg] on</code></td>
+            <td><code>command_request</code></td>
+            <td>on incoming chat</td>
+            <td>auto-reply, once per trigger</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      <code>spam</code> is the one with the most deliberate behaviour, so it is worth reading in
+      full: it refuses to send before spawn, waits a random 5–8 seconds after the join, and
+      rebuilds the origin uuid and request id for every single send. That last part is not
+      cosmetic — identical origins are the easiest thing for a server to collapse into one
+      action.
+    </p>
+
+    <pre><code>// the shape of one spam tick
+this.engine.externalCommandRandom(
+  `/me ${base} | §4§o§l&lt;signature&gt;§r - §0&lt;code&gt;`
+)</code></pre>
+
+    <p class="small muted">
+      <code>&lt;code&gt;</code> is 6 characters of <code>[A-Za-z0-9]</code>, regenerated per send, so
+      consecutive lines are never byte-identical. The signature itself is styled with
+      <code>§</code> formatting codes only — the server does not care, but the client renders them.
+    </p>
+
+    <h2 id="inbound"><span class="n">3.6</span> What comes back</h2>
+
+    <p>
+      Inbound <code>text</code> packets land as an event named after the packet, and the adapter
+      sorts them by <code>type</code> before anything reaches the console:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Incoming <code>type</code></th><th>Handling</th></tr></thead>
+        <tbody>
+          <tr><td><code>chat</code> with a <code>source_name</code></td><td>printed as <code>&lt;name&gt; message</code></td></tr>
+          <tr><td><code>chat</code> with an empty source</td><td>printed as-is — this is how a <code>/me</code> line arrives (<code>* External …</code>)</td></tr>
+          <tr><td><code>whisper</code>, <code>json_whisper</code></td><td>printed with a <code>[whisper]</code> prefix</td></tr>
+          <tr><td><code>raw</code>, <code>system</code>, <code>announcement</code>, <code>json</code>, <code>json_announcement</code></td><td>printed as server text</td></tr>
+          <tr><td><code>popup</code>, <code>tip</code>, <code>translation</code>, <code>jukebox_popup</code></td><td>dropped</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="small muted">
+      Both directions strip <code>§</code> codes before printing, and translation-style payloads
+      are decoded first — otherwise the console fills up with raw <code>rawtext</code> JSON.
+    </p>
+
+    <h2 id="gotchas"><span class="n">3.7</span> Gotchas</h2>
+
+    <ul>
+      <li><b>One write is one batch.</b> Sending 60 messages does not send one batch of 60 — it
+        sends 60 batches. At 25 ms cadence that is 40 packets/second of pure overhead; it works,
+        but it is why message loops cost more than they look like they should.</li>
+      <li><b>Chat is rate-limited server-side.</b> Different realms use different thresholds and
+        some anti-bot addons kick on the first burst. The 5–8 second arming delay exists because
+        sending before the join finishes simply gets dropped.</li>
+      <li><b>Length limits are enforced by the server, not the encoder.</b> A 400-character
+        "message" serialises fine and gets rejected.</li>
+      <li><b>Commands need permission.</b> <code>/me</code> is allowed to everyone;
+        anything else may silently fail or come back as an error line in
+        <code>command_output</code>.</li>
+      <li><b><code>player_entity_id</code> should be your runtime id</b>, which only exists after
+        <code>start_game</code>. Sending <code>0n</code> works on most servers, but it is a tell.</li>
+    </ul>
+
+    <div class="warn">
+      <p>
+        These loops are spam by design. On realms you do not own, that is a ban waiting to happen,
+        and it is against the terms of service in most contexts. The code is documented so the
+        protocol is understood, not as an invitation.
+      </p>
+    </div>
+
+  </main>
+</div>
+
+<footer>
+  <span>§ 03 sending messages</span>
+  <span class="spacer"></span>
+  <a href="packets.html#packet/text">text packet</a>
+  <a href="packets.html#packet/command_request">command_request</a>
+  <a href="movement.html">next: movement →</a>
+</footer>
+
+<script src="assets/protocol-data.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>(function(){try{var t=localStorage.getItem("bd-theme");if(!t){t=window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"}document.documentElement.dataset.theme=t}catch(e){}})()</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetherNet transport · Bedrock protocol notes</title>
+<meta name="description" content="NetherNet documented end to end: UDP discovery on 7551, its AES/HMAC wrapper, the signalling WebSocket, SDP identity assertions, WebRTC data channels and the Bedrock layer on top.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="index.html"><span class="mark"></span> bedrock / protocol notes</a>
+  <span class="crumb">§ 06 — <b>NetherNet</b></span>
+  <button class="theme-toggle" id="theme-toggle" type="button" aria-pressed="false">dark</button>
+
+  <span class="ver" data-version>1.26.60 · proto 2225</span>
+</header>
+
+<div class="shell">
+  <nav class="rail">
+    <div class="rail-head">Contents</div>
+    <ol>
+      <li><a href="index.html"><span class="n">01</span> Overview</a></li>
+      <li><a href="packets.html"><span class="n">02</span> Packet reference</a></li>
+      <li><a href="messages.html"><span class="n">03</span> Sending messages</a></li>
+      <li><a href="movement.html"><span class="n">04</span> Movement</a></li>
+      <li><a href="auth.html"><span class="n">05</span> Authentication</a></li>
+      <li><a href="nethernet.html" class="active"><span class="n">06</span> NetherNet</a></li>
+      <li><a href="engine.html"><span class="n">07</span> bedrockx engine</a></li>
+      <li><a href="rewrite.html"><span class="n">08</span> Rewriting the client</a></li>
+      <li><a href="exploits.html"><span class="n">09</span> Exploits and abuse</a></li>
+      <li><a href="automod.html"><span class="n">10</span> Anticheat and automod</a></li>
+    </ol>
+    <div class="rail-note">
+      Generated from the schema in this repository. Every field name is what the
+      encoder on disk expects.
+    </div>
+  </nav>
+
+  <main>
+
+  <section class="hero">
+    <h1>NetherNet</h1>
+    <p class="lede">
+      The transport Bedrock uses instead of RakNet for realms and cross-network LAN play:
+      a UDP discovery/beacon layer on port <code>7551</code>, a Microsoft-hosted signalling
+      WebSocket, and a WebRTC data-channel pair carrying the normal Bedrock batch.
+      Everything below is what <code>src/engine/bedrockx-lib/nethernet/</code> implements.
+    </p>
+  </section>
+
+  <div class="cols">
+    <div class="card">
+      <div class="kicker">Transport modes</div>
+      <h3><code>NETHERNET</code></h3>
+      <p class="small muted">UDP discovery + WebRTC, signalling over
+        <code>wss://signal.franchise.minecraft-services.net/ws/v1.0/signaling/&lt;id&gt;</code>
+        with the compact <code>{Type, To, Message}</code> envelope.</p>
+    </div>
+    <div class="card">
+      <div class="kicker">Transport modes</div>
+      <h3><code>NETHERNET_JSONRPC</code></h3>
+      <p class="small muted">Same WebRTC, different signalling API:
+        <code>…/ws/v1.0/messaging/connect</code> with JSON-RPC 2.0 methods
+        (<code>Signaling_*</code>). Used by newer realms endpoints.</p>
+    </div>
+    <div class="card">
+      <div class="kicker">Transport modes</div>
+      <h3><code>DEFAULT</code></h3>
+      <p class="small muted">RakNet. <code>0xfe</code> batch header, AES-GCM frames,
+        native <code>.node</code> binding. See the
+        <a href="engine.html">engine page</a>.</p>
+    </div>
+  </div>
+
+  <h2 id="layers">Layering</h2>
+
+  <div class="flow"><span class="c">UDP 7551 broadcast</span>            <span class="c">WSS signalling</span>              <span class="c">(either one, for signalling only)</span>
+<span class="c">discovery_request  ─┐</span>
+<span class="c">discovery_response ─┼─►</span> peer table          <span class="c">│</span>
+<span class="c">discovery_message  ─┘</span>   sender_id → addr    <span class="c">│</span>
+                                             <span class="c">▼</span>
+                              signal strings: <span class="y">CONNECTREQUEST / CONNECTRESPONSE / CANDIDATEADD</span>
+                                             <span class="c">│</span>
+                                             <span class="c">▼</span>
+                              <span class="g">WebRTC (ICE + DTLS)</span>
+                                ├─ ReliableDataChannel   ordered
+                                └─ UnreliableDataChannel unordered, maxRetransmits 0
+                                             <span class="c">│</span>
+                                             <span class="c">▼</span>
+                              <span class="p">segment framing</span>: byte0 = segments remaining, 50 000 B chunks
+                                             <span class="c">│</span>
+                                             <span class="c">▼</span>
+                              <span class="p">Bedrock batch</span>: [compressor id][deflate] · no 0xfe · no AES</div>
+
+  <p class="small muted">
+    The important consequence: over NetherNet the Bedrock payload is <b>not</b> encrypted by the
+    Bedrock layer and carries <b>no</b> <code>0xfe</code> batch header — DTLS already provides both
+    confidentiality and integrity. The compression byte survives.
+  </p>
+
+  <h2 id="discovery">1 · Discovery on UDP 7551</h2>
+
+  <p>
+    <code>nethernet/src/client.js</code> opens a <code>udp4</code> socket, enables broadcast, and
+    every <b>2 seconds</b> sends a <code>discovery_request</code> to
+    <code>255.255.255.255:7551</code>. Any peer answers with a <code>discovery_response</code>
+    whose <code>data</code> field is that peer's advertisement JSON; the client stores
+    <code>sender_id → {rinfo, params}</code> so it can send unicast
+    <code>discovery_message</code> packets back to a chosen peer.
+  </p>
+
+  <h3>Secure wrapper (both discovery packets and all their replies)</h3>
+
+  <pre><code>packet = HMAC-SHA256(body)      // 32 bytes, plaintext
+       + AES-256-ECB(body)      // ciphertext
+
+key    = SHA-256( LE64(0xdeadbeef) )   // static, same for every peer</code></pre>
+
+  <p class="small muted">
+    That static key is what <code>nethernet/src/crypto.js</code> builds. It is obfuscation, not
+    security — there is no key exchange and no per-session secret at this layer. Everything that
+    actually needs to be secret is inside WebRTC/DTLS.
+  </p>
+
+  <h3>The three packets</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>id (lu16 mapper)</th><th>Name</th><th>Fields</th></tr></thead>
+      <tbody>
+        <tr><td><span class="badge id">0</span></td><td><code>discovery_request</code></td>
+          <td><code>sender_id: lu64</code>, <code>reserved: bytes[8]</code></td></tr>
+        <tr><td><span class="badge id">1</span></td><td><code>discovery_response</code></td>
+          <td><code>sender_id: lu64</code>, <code>reserved: bytes[8]</code>,
+            <code>data: string&lt;lu32&gt;</code> (advertisement JSON)</td></tr>
+        <tr><td><span class="badge id">2</span></td><td><code>discovery_message</code></td>
+          <td><code>sender_id: lu64</code>, <code>reserved: bytes[8]</code>,
+            <code>recipient_id: lu64</code>, <code>data: string&lt;lu32&gt;</code> (signal string)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="small">
+    Packet framing inside the encrypted body is protodef
+    <code>["encapsulated", { lengthType: "lu16" }]</code>: a 2-byte little-endian length, then the
+    mapper id as <code>lu16</code>, then the switch body. The full schema is 60 lines:
+    <code>src/engine/bedrockx-lib/nethernet/src/protocol.json</code>.
+  </p>
+
+  <div class="note">
+    <b><code>sender_id</code> is a 64-bit value.</b> Over UDP it is the peer's NetherNet numeric id;
+    over the signalling WebSocket the same ids appear as JSON, which is why
+    <code>json-bigint</code> is used — a plain <code>JSON.parse</code> rounds anything above 2<sup>53</sup>
+    and the routing silently targets the wrong peer.
+  </div>
+
+  <h2 id="signalling">2 · The signalling WebSocket</h2>
+
+  <h3>Legacy envelope (<code>NETHERNET</code>)</h3>
+
+  <p>
+    <code>websocket/signal.js</code> connects to
+    <code>wss://signal.franchise.minecraft-services.net/ws/v1.0/signaling/&lt;serverNetherNetId&gt;</code>
+    with these headers:
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Header</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>Authorization</code></td><td>Bedrock services token from <code>authflow.getMinecraftBedrockServicesToken({ version })</code></td></tr>
+        <tr><td><code>session-id</code></td><td>this client's random <code>uint64</code> NetherNet id</td></tr>
+        <tr><td><code>request-id</code></td><td>fresh v4 uuid per connect</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Messages are JSON, all keys capitalised:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Direction</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><span class="badge id">0</span> <code>RequestPing</code></td><td>both</td>
+          <td>Liveness. Client sends one every 2 s; if nothing arrives for 60 s it terminates the socket.</td></tr>
+        <tr><td><span class="badge id">1</span> <code>Signal</code></td><td>both</td>
+          <td><code>{ Type: 1, To: &lt;peer id&gt;, Message: "&lt;signal string&gt;" }</code> in, and <code>From</code> identifies the sender on the way back.</td></tr>
+        <tr><td><span class="badge id">2</span> <code>Credentials</code></td><td>server only</td>
+          <td><code>Message</code> is JSON containing <code>TurnAuthServers</code>. <code>connect()</code> waits up to 15 s for it.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="small">
+    Reconnect policy: close codes <code>1006</code>, <code>1011</code>, <code>4401</code> (and
+    <code>0</code>) retry up to <b>5</b> times, 15 s apart. Anything else emits
+    <code>error</code>. Every reconnect re-fetches the Bedrock services token.
+  </p>
+
+  <h3>JSON-RPC envelope (<code>NETHERNET_JSONRPC</code>)</h3>
+
+  <p>
+    <code>websocket/signal-jsonrpc.js</code> connects to
+    <code>wss://signal.franchise.minecraft-services.net/ws/v1.0/messaging/connect</code> and speaks
+    JSON-RPC 2.0:
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>Signaling_TurnAuth_v1_0</code></td><td>requested on open — TURN credentials come back as <code>result.TurnAuthServers</code>.</td></tr>
+        <tr><td><code>Signaling_SendClientMessage_v1_0</code></td>
+          <td><code>params: { toPlayerId, messageId, message }</code>; <code>message</code> is a JSON-RPC string itself:
+            <code>Signaling_WebRtc_v1_0</code> with <code>params.netherNetId</code> and <code>params.message</code> (the signal string).</td></tr>
+        <tr><td><code>Signaling_ReceiveMessage_v1_0</code></td>
+          <td>incoming; the client acknowledges with <code>result: null</code> and then sends
+            <code>Signaling_DeliveryNotification_V1_0</code> back to the sender.</td></tr>
+        <tr><td><code>System_Ping_v1_0</code> / <code>System_Pong_v1_0</code></td>
+          <td>ping every 60 s, pong echoed with the same <code>id</code>.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="signals">3 · The signal strings</h2>
+
+  <p>
+    Both signalling flavours carry the same text format
+    (<code>nethernet/src/signalling.js</code>):
+  </p>
+
+  <pre><code>&lt;TYPE&gt; &lt;connectionId&gt; &lt;data…&gt;
+
+TYPE         CONNECTREQUEST | CONNECTRESPONSE | CANDIDATEADD | CONNECTERROR
+connectionId this connection's random uint64 — answers and candidates echo it back
+data         for CONNECTREQUEST / CONNECTRESPONSE: the whole SDP (spaces and newlines intact)
+             for CANDIDATEADD: the ICE candidate string</code></pre>
+
+  <p class="small muted">
+    Parsing splits on the first two spaces only, then re-joins the remainder — SDP is full of spaces
+    and must survive untouched.
+  </p>
+
+  <h2 id="webrtc">4 · WebRTC</h2>
+
+  <h3>The offer</h3>
+
+  <ol class="steps">
+    <li><b>Peer connection</b> — <code>new RTCPeerConnection({ iceServers: credentials, bundlePolicy: 'max-bundle' })</code>.
+      <code>iceServers</code> is the TURN list the signalling server just handed over; without it a
+      remote realm has no relay path and the data channel never opens.
+      <div class="small muted">This is the fork's whole reason to exist: upstream v1.4.6 hardcodes
+        <code>iceServers: []</code> and therefore cannot join remote realms at all.</div></li>
+
+    <li><b>Two data channels, created by the client</b> —
+      <code>ReliableDataChannel</code> <code>{ ordered: true }</code> and
+      <code>UnreliableDataChannel</code> <code>{ ordered: false, maxRetransmits: 0 }</code>.
+      Bedrock only ever sends on the reliable one; the unreliable channel exists because the
+      vanilla client creates it.</li>
+
+    <li><b>SDP munging</b> — replace the <code>o=</code> line with
+      <code>o=- &lt;localNetworkId&gt; 2 IN IP4 127.0.0.1</code> so the server sees the NetherNet id
+      instead of a random session id.</li>
+
+    <li><b>Identity assertion</b> — take <code>a=fingerprint:sha-256 &lt;HEX&gt;</code>, sign a
+      JSON document with the client's P-384 key (ES384 JWS), then append
+      <code>a=identity:&lt;base64&gt;</code>. Details below.</li>
+
+    <li><b>Send</b> — <code>CONNECTREQUEST &lt;connectionId&gt; &lt;sdp&gt;</code> to the server's
+      NetherNet id.</li>
+  </ol>
+
+  <h3>The identity assertion</h3>
+
+  <pre><code>// 1. signed payload
+JSON: { "fingerprint": [ { "algorithm": "sha-256", "digest": "&lt;sdp fingerprint hex&gt;" } ] }
+
+// 2. compact JWS, ES384, key = client P-384 private key
+jws = base64url(header).base64url(payload).base64url(signature)
+      header = { alg: "ES384" }
+
+// 3. payload is dropped on purpose
+fingerprints = `${jws.split('.')[0]}..${jws.split('.')[2]}`
+
+// 4. wrapped with the Xbox identity provider
+assertion = JSON.stringify({ fingerprints, token: &lt;bedrock services token&gt; })
+a=identity:base64(JSON.stringify({
+  assertion,
+  idp: {
+    domain: "https://authorization.franchise.minecraft-services.net/",
+    protocol: "default"
+  }
+}))</code></pre>
+
+  <p class="small muted">
+    The token embedded here is the same <code>mcToken</code> used as the signalling
+    <code>Authorization</code> header. The server validates that the signed SDP fingerprint matches
+    the certificate it actually sees in the DTLS handshake — which is what stops anyone from
+    impersonating a peer's media identity.
+  </p>
+
+  <h3>ICE</h3>
+
+  <p>
+    Every local candidate is sent as <code>CANDIDATEADD</code>, except host-loopback and TCP
+    candidates, which this client drops (<code>tcp</code>, <code>::1</code>, <code>127.0.0.1</code>).
+    Incoming candidates are parsed back into field-by-field
+    <code>RTCIceCandidate</code> objects (foundation, component, protocol, priority, address, port,
+    type, <code>raddr</code>/<code>rport</code>, <code>ufrag</code>).
+  </p>
+
+  <div class="warn">
+    <b>Candidate id rewrite.</b> A <code>CANDIDATEADD</code> that arrives with the
+    <em>server's</em> NetherNet id in <code>networkId</code> is rewritten to this connection's local
+    id before being applied. Skip that and multi-connection bots misroute each other's candidates.
+  </div>
+
+  <h3>Answer handling (the multi-client patch)</h3>
+
+  <p>
+    The signalling service fans a message out to <b>every</b> socket authenticated as the same
+    player. With several connections at once (a bot firing three joins per loop), each peer
+    therefore receives the other connections' answers first. Applying a foreign answer moves the
+    peer connection to <code>stable</code>, after which its own answer is rejected
+    (<em>"answer in stable state"</em>) and only one of N connections ever works.
+  </p>
+
+  <pre><code>// nethernet/src/client.js — LOCAL PATCH, not upstream
+if (signal.connectionId != null &amp;&amp;
+    String(signal.connectionId) !== String(this.connectionId)) return
+
+switch (this.rtcConnection.signalingState) {
+  case 'stable': return   // already answered
+  case 'closed': return   // nothing to do
+}</code></pre>
+
+  <h2 id="framing">5 · Data-channel framing</h2>
+
+  <p>
+    A Bedrock batch can exceed what one SCTP message should carry, so
+    <code>nethernet/src/connection.js</code> splits it:
+  </p>
+
+  <pre><code>MAX_MESSAGE_SIZE = 50 000 bytes        // SCTP's hard ceiling is 262 143
+
+segments = ceil(len / 50000)
+message[i] = [ (segments - 1 - i) , chunk_i ]   // byte 0 = segments still to come
+
+receiver: accumulate; when byte0 == 0 emit('encapsulated', whole buffer)
+          a mismatch against promisedSegments throws "Invalid promised segments"</code></pre>
+
+  <p class="small muted">
+    Sends made before the reliable channel reports <code>open</code> are queued and flushed on
+    <code>onopen</code>; sending on a closing/closed channel throws
+    <code>Reliable channel is not open</code>.
+  </p>
+
+  <h2 id="join">6 · Realm join, end to end</h2>
+
+  <div class="flow"><span class="c">bot.js</span>  joinWithRetry(realm 25168337)
+   <span class="c">│</span>
+   <span class="c">▼</span> Realms API → { host: "e27d6dd2-…", networkProtocol: "NETHERNET" }
+<span class="g">authflow</span>  → mcToken (Bedrock services)                     <span class="c">~1-2 s</span>
+   <span class="c">│</span>
+   <span class="c">▼</span>
+<span class="y">signalling WS</span> open → wait for <span class="y">credentials</span> (15 s timeout)
+   <span class="c">│</span>   TurnAuthServers → iceServers (+ tcp / turns:5349 variants)
+   <span class="c">▼</span>
+offer (+ o= rewrite, + a=identity)  →  <span class="y">CONNECTREQUEST</span>
+   <span class="c">│</span>   server −─►  <span class="y">CONNECTRESPONSE</span> (answer, same connectionId)
+   <span class="c">│</span>   both  −──►  <span class="y">CANDIDATEADD</span> …
+   <span class="c">▼</span>
+<span class="g">ICE + DTLS</span>  → connectionState "connected" → emit connected
+   <span class="c">│</span>
+   <span class="c">▼</span> reliable channel open
+<span class="p">request_network_settings</span>  { client_protocol: 2225 }
+   <span class="c">│</span>
+   <span class="c">▼</span>
+<span class="p">network_settings</span>  compression_algorithm, compression_threshold
+   <span class="c">│</span>
+   <span class="c">▼</span>
+<span class="p">login</span>  identity JWT + client JWT (ES384, x5u = P-384 public key)
+   <span class="c">│</span>
+   <span class="c">▼</span>
+<span class="p">server_to_client_handshake</span>  → <span class="p">client_to_server_handshake</span>   <span class="c">(no AES on this transport)</span>
+   <span class="c">│</span>
+   <span class="c">▼</span>
+<span class="p">play_status: login_success</span> → resource packs → <span class="p">start_game</span> → <span class="g">spawned</span></div>
+
+  <h2 id="failures">7 · Failure modes worth knowing</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>Cause</th><th>Where</th></tr></thead>
+      <tbody>
+        <tr><td>Joins hang, no data channel</td><td>No TURN credentials (empty <code>iceServers</code>) — remote realm has no relay path.</td><td><code>client.js</code> <code>createOffer()</code></td></tr>
+        <tr><td>Only 1 of N concurrent connections joins</td><td>Foreign answers applied; connection flips to <code>stable</code>.</td><td><code>handleAnswer()</code> patch</td></tr>
+        <tr><td><code>Invalid promised segments</code></td><td>Two batches interleaved on one channel (a second sender). Keep one writer per channel.</td><td><code>connection.js</code></td></tr>
+        <tr><td><code>Reliable channel is not open</code></td><td>Write during teardown; queue instead of sending.</td><td><code>connection.js</code> <code>send()</code></td></tr>
+        <tr><td><code>Checksum mismatch</code> on every packet</td><td>That is the <em>discovery</em> wrapper, not Bedrock: wrong static key or a non-NetherNet peer on 7551.</td><td><code>nethernet/src/crypto.js</code></td></tr>
+        <tr><td>Silent crash on kick</td><td><code>close()</code> nulls <code>this.nethernet</code> while the packet reader still dereferences it.</td><td><code>client.js</code> close guard (local patch)</td></tr>
+        <tr><td>4401 on signalling</td><td>Expired/invalid Bedrock services token — retried 5×, then error.</td><td><code>websocket/signal.js</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="files">8 · File map</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>File</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>nethernet/src/client.js</code></td><td>UDP socket, discovery, WebRTC offer/answer, ICE, channel creation, id bookkeeping.</td></tr>
+        <tr><td><code>nethernet/src/connection.js</code></td><td>Data channels, 50 000-byte segmentation and reassembly, send queue.</td></tr>
+        <tr><td><code>nethernet/src/crypto.js</code></td><td>Static AES-256-ECB + HMAC-SHA256 wrapper for discovery packets.</td></tr>
+        <tr><td><code>nethernet/src/util.js</code></td><td>Packet build/verify helpers, random <code>uint64</code>.</td></tr>
+        <tr><td><code>nethernet/src/serializer.js</code></td><td>protodef compiler + serializer for <code>nethernet_packet</code>.</td></tr>
+        <tr><td><code>nethernet/src/signalling.js</code></td><td>Signal string ⇄ object.</td></tr>
+        <tr><td><code>nethernet/src/protocol.json</code></td><td>The complete NetherNet wire schema (5 types, 3 packets).</td></tr>
+        <tr><td><code>websocket/signal.js</code></td><td>Legacy signalling WSS client + TURN credential parsing.</td></tr>
+        <tr><td><code>websocket/signal-jsonrpc.js</code></td><td>JSON-RPC signalling client.</td></tr>
+        <tr><td><code>nethernet.js</code></td><td>Adapter that turns the above into <code>NethernetClient { connect, sendReliable, close }</code>.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    NetherNet carries ordinary Bedrock packets — once the channel is up, everything on the
+    <a href="packets.html">packets page</a> applies unchanged. The only differences are the missing
+    <code>0xfe</code> header and the missing AES layer, both handled by
+    <code>Client.init()</code> when <code>transport</code> contains <code>NETHERNET</code>.
+  </div>
+
+</main>
+</div>
+
+<footer>
+  <span>§ 06 nethernet</span>
+  <span class="spacer"></span>
+  <a href="packets.html">packets</a>
+  <a href="engine.html">engine</a>
+  <a href="rewrite.html">next: rewrite →</a>
+</footer>
+
+<script src="assets/protocol-data.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

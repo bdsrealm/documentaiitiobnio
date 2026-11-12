@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>(function(){try{var t=localStorage.getItem('bd-theme');if(!t){t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}document.documentElement.dataset.theme=t}catch(e){}})()</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bedrock protocol notes</title>
+<meta name="description" content="A field manual for the Minecraft Bedrock protocol: packets, messaging, movement, authentication, the NetherNet transport and the client.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body class="home">
+
+<header class="top">
+  <a class="brand" href="index.html"><span class="mark"></span> bedrock / protocol notes</a>
+  <span class="crumb">field manual · <b id="cover-year">2026</b></span>
+  <button class="theme-toggle" id="theme-toggle" type="button" aria-pressed="false">dark</button>
+  <span class="ver" data-version>1.26.60 · proto 2225</span>
+</header>
+
+<div class="cover-wrap">
+
+  <section class="cover">
+    <div class="cover-text">
+      <p class="eyebrow">Minecraft Bedrock · protocol 2225 · game 1.26.60</p>
+      <h1 class="cover-title">Protocol<br><em>field</em><br>notes.</h1>
+      <p class="cover-lede">
+        254 packets, one WebRTC transport, and the client that speaks both.
+        Written from the schema this code compiles — not from a wiki that was
+        right two versions ago.
+      </p>
+      <p class="cover-links">
+        <a class="cta" href="packets.html">Open the packet index <span>→</span></a>
+        <a class="cta ghost" data-random href="packets.html">Surprise me</a>
+      </p>
+    </div>
+
+    <aside class="specimen" aria-label="Sample of documented packets">
+      <div class="specimen-head">
+        <span>specimen</span>
+        <span class="live"><i></i> live from schema</span>
+      </div>
+      <ol data-specimen></ol>
+      <a class="specimen-foot" href="packets.html">
+        <span>254 entries</span>
+        <span>open index →</span>
+      </a>
+    </aside>
+  </section>
+
+  <div class="ledger">
+    <div><b data-stat="packetCount">—</b><span>packets</span></div>
+    <div><b data-stat="typeCount">—</b><span>reusable types</span></div>
+    <div><b data-stat="arrayPacketCount">—</b><span>with arrays</span></div>
+    <div><b data-stat="arrayFieldCount">—</b><span>array fields</span></div>
+    <div><b>20</b><span>ticks / second</span></div>
+    <div><b>2</b><span>transports</span></div>
+  </div>
+
+  <section class="cover-body">
+
+    <div class="cover-col">
+      <h2 id="contents">Contents</h2>
+      <ol class="chapter-index">
+        <li>
+          <a href="packets.html">
+            <span class="ci-num">02</span>
+            <span class="ci-body">
+              <span class="ci-title">Packet reference</span>
+              <span class="ci-sub">Every packet by id: field tree, array paths, mappers, switches, and a write() skeleton.</span>
+            </span>
+            <span class="ci-meta">254</span>
+          </a>
+        </li>
+        <li>
+          <a href="messages.html">
+            <span class="ci-num">03</span>
+            <span class="ci-body">
+              <span class="ci-title">Sending messages</span>
+              <span class="ci-sub">The text packet, /me through command origins, and what a message loop really sends.</span>
+            </span>
+            <span class="ci-meta">chat</span>
+          </a>
+        </li>
+        <li>
+          <a href="movement.html">
+            <span class="ci-num">04</span>
+            <span class="ci-body">
+              <span class="ci-title">Movement</span>
+              <span class="ci-sub">player_auth_input at 20 Hz, server reconciliation, and a walker that stays corrected.</span>
+            </span>
+            <span class="ci-meta">ticks</span>
+          </a>
+        </li>
+        <li>
+          <a href="auth.html">
+            <span class="ci-num">05</span>
+            <span class="ci-body">
+              <span class="ci-title">Authentication</span>
+              <span class="ci-sub">Device code, the Bedrock session bound to your key, device spoofing, token storage.</span>
+            </span>
+            <span class="ci-meta">xbox</span>
+          </a>
+        </li>
+        <li>
+          <a href="nethernet.html">
+            <span class="ci-num">06</span>
+            <span class="ci-body">
+              <span class="ci-title">NetherNet</span>
+              <span class="ci-sub">Discovery on UDP 7551, the signalling socket, SDP identity, data-channel framing.</span>
+            </span>
+            <span class="ci-meta">webrtc</span>
+          </a>
+        </li>
+        <li>
+          <a href="engine.html">
+            <span class="ci-num">07</span>
+            <span class="ci-body">
+              <span class="ci-title">bedrockx engine</span>
+              <span class="ci-sub">State machine, handshake, AES framing, compression, the packet API and the relay.</span>
+            </span>
+            <span class="ci-meta">internals</span>
+          </a>
+        </li>
+        <li>
+          <a href="rewrite.html">
+            <span class="ci-num">08</span>
+            <span class="ci-body">
+              <span class="ci-title">Rewriting the client</span>
+              <span class="ci-sub">Where this implementation cuts corners, and the shape a better one would take.</span>
+            </span>
+            <span class="ci-meta">notes</span>
+          </a>
+        </li>
+        <li>
+          <a href="exploits.html">
+            <span class="ci-num">09</span>
+            <span class="ci-body">
+              <span class="ci-title">Exploits and abuse</span>
+              <span class="ci-sub">Array bombs, NBT depth, floods, position lies — and the checks that make each one cheap to refuse.</span>
+            </span>
+            <span class="ci-meta">defence</span>
+          </a>
+        </li>
+        <li>
+          <a href="automod.html">
+            <span class="ci-num">10</span>
+            <span class="ci-body">
+              <span class="ci-title">Anticheat and automod</span>
+              <span class="ci-sub">A second client with operator: join, score spam and bots, kick and ban through commands.</span>
+            </span>
+            <span class="ci-meta">mod</span>
+          </a>
+        </li>
+      </ol>
+    </div>
+
+    <div class="cover-col side">
+      <h2>Colophon</h2>
+      <dl class="kv tight">
+        <dt>schema</dt><dd><code>protocol.json</code></dd>
+        <dt>version</dt><dd><span data-meta="gameVersion">1.26.60</span> / <span data-meta="protocolVersion">2225</span></dd>
+        <dt>packets</dt><dd><span data-stat="packetCount">—</span></dd>
+        <dt>types</dt><dd><span data-stat="typeCount">—</span></dd>
+        <dt>generated</dt><dd><span data-meta="generated">—</span></dd>
+      </dl>
+
+      <h2>To read it</h2>
+      <p class="small muted">
+        Serve the folder so every page and its dataset load from one origin:
+      </p>
+      <pre><code>npx serve documentation
+
+# or, with nothing installed
+node documentation/tools/serve.js 4178</code></pre>
+      <p class="small muted">
+        Press <kbd>/</kbd> in the packet index to search by name, id or hex.
+        Every packet page ends in a <code>client.write()</code> skeleton.
+      </p>
+
+      <h2>Cross-checks</h2>
+      <ul class="link-list">
+        <li><a href="https://mojang.github.io/bedrock-protocol-docs/">Mojang protocol docs</a></li>
+        <li><a href="https://github.com/CloudburstMC/protocol-docs/tree/master/packets">CloudburstMC protocol-docs</a></li>
+        <li><a href="https://github.com/Sandertv/gophertunnel/tree/master/minecraft/protocol/packet">gophertunnel packet/</a></li>
+        <li><a href="https://github.com/PrismarineJS/minecraft-data/blob/master/data/bedrock/latest/proto.yml">PrismarineJS proto.yml</a></li>
+      </ul>
+    </div>
+
+  </section>
+
+  <div class="cover-foot">
+    <span>Two transports, one packet layer.</span>
+    <span class="rule"></span>
+    <a href="nethernet.html">NetherNet →</a>
+    <a href="engine.html">engine →</a>
+    <a href="rewrite.html">rewrite →</a>
+  </div>
+
+</div>
+
+<footer>
+  <span>bedrock protocol notes</span>
+  <span data-version>1.26.60 / 2225</span>
+  <span class="spacer"></span>
+  <a href="packets.html">packets</a>
+  <a href="nethernet.html">nethernet</a>
+  <a href="engine.html">engine</a>
+  <a href="rewrite.html">rewrite</a>
+  <a href="exploits.html">exploits</a>
+  <a href="automod.html">automod</a>
+</footer>
+
+<script src="assets/protocol-data.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

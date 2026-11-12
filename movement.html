@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>(function(){try{var t=localStorage.getItem('bd-theme');if(!t){t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}document.documentElement.dataset.theme=t}catch(e){}})()</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Movement · Bedrock protocol notes</title>
+<meta name="description" content="How Bedrock movement works: player_auth_input every tick, server reconciliation through move_player, and how to make a bot walk.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="index.html"><span class="mark"></span> bedrock / protocol notes</a>
+  <span class="crumb">§ 04 — <b>Movement</b></span>
+  <button class="theme-toggle" id="theme-toggle" type="button" aria-pressed="false">dark</button>
+  <span class="ver">1.26.60 · proto 2225</span>
+</header>
+
+<div class="shell">
+  <nav class="rail">
+    <div class="rail-head">Contents</div>
+    <ol>
+      <li><a href="index.html"><span class="n">01</span> Overview</a></li>
+      <li><a href="packets.html"><span class="n">02</span> Packet reference</a></li>
+      <li><a href="messages.html"><span class="n">03</span> Sending messages</a></li>
+      <li><a href="movement.html" class="active"><span class="n">04</span> Movement</a></li>
+      <li><a href="auth.html"><span class="n">05</span> Authentication</a></li>
+      <li><a href="nethernet.html"><span class="n">06</span> NetherNet</a></li>
+      <li><a href="engine.html"><span class="n">07</span> bedrockx engine</a></li>
+      <li><a href="rewrite.html"><span class="n">08</span> Rewriting the client</a></li>
+      <li><a href="exploits.html"><span class="n">09</span> Exploits and abuse</a></li>
+      <li><a href="automod.html"><span class="n">10</span> Anticheat and automod</a></li>
+    </ol>
+    <div class="rail-note">
+      The client does not move the player. It reports what the player did, twenty times a
+      second, and the server decides whether that was true.
+    </div>
+  </nav>
+
+  <main>
+
+    <section class="hero">
+      <p class="eyebrow">Chapter four</p>
+      <h1>Movement</h1>
+      <p class="lede">
+        Bedrock movement is client-authoritative with server correction: you send your position
+        in <code>player_auth_input</code>, the server answers with <code>move_player</code> to agree
+        or drag you back, and everything else — jumping, sneaking, riding — is a flag in the same
+        packet.
+      </p>
+    </section>
+
+    <div class="note">
+      <p>
+        This bot does not move today. It listens to <code>move_player</code> for logging
+        (<code>teleports</code>, <code>chunks</code>, <code>nocom</code>, <code>botdet</code>,
+        <code>blindad</code>/<code>cblind</code>) and for the anticrash position guard, but nothing
+        sends <code>player_auth_input</code>. This chapter is what it would take to add that.
+      </p>
+    </div>
+
+    <h2 id="model"><span class="n">4.1</span> The model</h2>
+
+    <div class="flow"><span class="c">client, 20× per second</span>                    <span class="c">server</span>
+     <span class="p">player_auth_input</span>  position, move_vector, yaw, tick
+              <span class="c">──────────────────────────────▶</span>
+                                                   <span class="c">validate / simulate</span>
+     <span class="p">move_player</span>  mode normal | reset | rotation | teleport
+              <span class="c">◀──────────────────────────────</span>
+                                               <span class="c">reject → snap back</span>
+     <span class="p">set_entity_motion</span>  velocity (knockback, water, pistons)
+              <span class="c">◀──────────────────────────────</span></div>
+
+    <p>
+      There is no "walk to x" packet. The client integrates its own movement and tells the server
+      where it ended up; the server compares that against its own simulation of you and either
+      accepts it or sends a correction. Two consequences shape every implementation:
+    </p>
+
+    <ul>
+      <li>You must run a tick loop. Send at roughly 20 Hz, not on demand — the server expects a
+        heartbeat and some anti-cheats measure its regularity.</li>
+      <li>You must accept corrections. If you keep sending the position you wanted instead of the
+        one the server gave back, you will be rubber-banded forever and eventually kicked.</li>
+    </ul>
+
+    <h2 id="packet"><span class="n">4.2</span> player_auth_input</h2>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>What to put there</th></tr></thead>
+        <tbody>
+          <tr><td><code>pitch</code>, <code>yaw</code></td><td><code>lf32</code></td>
+            <td>Degrees. Pitch −90 looks straight up, +90 straight down. Yaw 0 faces +Z, 90 faces −X.</td></tr>
+          <tr><td><code>position</code></td><td><code>vec3f</code></td>
+            <td>Feet position — the same number <code>move_player</code> reports.</td></tr>
+          <tr><td><code>move_vector</code></td><td><code>vec2f</code></td>
+            <td>Intended direction, length ≤ 1. This is input, not velocity.</td></tr>
+          <tr><td><code>head_yaw</code></td><td><code>lf32</code></td>
+            <td>Usually equal to <code>yaw</code> unless the body is turned separately.</td></tr>
+          <tr><td><code>input_data</code></td><td><code>InputData[]varint</code></td>
+            <td>Flags such as <code>jumping</code>, <code>sneaking</code>, <code>up</code>,
+              <code>down</code>, <code>left</code>, <code>right</code>, <code>sprint_down</code>,
+              <code>ascend</code>, <code>descend</code>.</td></tr>
+          <tr><td><code>input_mode</code></td><td><code>mapper&lt;varint&gt;</code></td>
+            <td><code>mouse</code> 1 · <code>touch</code> 2 · <code>game_pad</code> 3.
+              Keep it consistent with the device you claim at login.</td></tr>
+          <tr><td><code>play_mode</code></td><td><code>mapper&lt;varint&gt;</code></td><td><code>normal</code>.</td></tr>
+          <tr><td><code>interaction_model</code></td><td><code>mapper&lt;zigzag32&gt;</code></td>
+            <td><code>crosshair</code> 1 for mouse/keyboard.</td></tr>
+          <tr><td><code>tick</code></td><td><code>varint64</code></td><td>Monotonic tick counter, incremented once per send.</td></tr>
+          <tr><td><code>delta</code></td><td><code>vec3f</code></td><td>Position change since the previous tick.</td></tr>
+          <tr><td><code>block_action</code></td><td><code>option&lt;array&gt;</code></td><td><code>[]</code> for walking; used for breaking/placing.</td></tr>
+          <tr><td><code>transaction</code>, <code>item_stack_request</code>, <code>vehicle_rotation</code>, <code>predicted_vehicle</code></td>
+            <td><code>option</code></td><td><code>undefined</code> unless you are using or riding something.</td></tr>
+          <tr><td><code>analogue_move_vector</code>, <code>raw_move_vector</code></td><td><code>vec2f</code></td>
+            <td>Same direction as <code>move_vector</code> for keyboard input.</td></tr>
+          <tr><td><code>camera_orientation</code></td><td><code>vec3f</code></td><td>Zero for normal third/first person.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="small muted">
+      Full switch cases and nested option types: <a href="packets.html#packet/player_auth_input">the
+      <code>player_auth_input</code> page</a>. Field order matters — protodef writes them in schema order,
+      and it is not the order a wiki lists them in.
+    </p>
+
+    <h2 id="server"><span class="n">4.3</span> What the server sends back</h2>
+
+    <dl class="kv">
+      <dt><code>move_player.mode</code></dt>
+      <dd><code>normal</code> accepted · <code>reset</code> health/respawn reset ·
+        <code>rotation</code> yaw/pitch only · <code>teleport</code> forced position.</dd>
+      <dt><code>move_player.on_ground</code></dt>
+      <dd>Authoritative ground state. Copy it; do not invent it.</dd>
+      <dt><code>move_player.teleport.cause</code></dt>
+      <dd><code>unknown</code> · <code>projectile</code> · <code>chorus_fruit</code> ·
+        <code>command</code> · <code>behavior</code>.</dd>
+      <dt><code>set_entity_motion</code></dt>
+      <dd>Velocity the server applied to you (knockback, water current, pistons). Ignore it and your
+        next position will be wrong.</dd>
+      <dt><code>tick_sync</code></dt>
+      <dd><code>request_time</code> / <code>response_time</code>, both <code>li64</code>. Servers send
+        it to measure the tick the client is on; a client that never answers drifts.</dd>
+    </dl>
+
+    <h2 id="implement"><span class="n">4.4</span> A minimal walker</h2>
+
+    <p>
+      This is enough to walk in a straight line and stay corrected. It assumes you have
+      <code>client</code> (the bedrockx client) and a runtime id from <code>start_game</code>.
+    </p>
+
+    <div class="code-head">movement.js — 20 Hz tick loop <span class="spacer"></span></div>
+    <pre><code>const TICK_MS = 50
+const WALK = 4.317 / 20          // blocks per tick, walking speed
+let ticks = 0n
+let pos = { x: 0, y: 64, z: 0 }  // replace with the spawn position
+let yaw = 0, pitch = 0
+let onGround = true
+let jumping = false
+
+// adopt the server's position whenever it disagrees
+client.on('move_player', (p) =&gt; {
+  if (p.runtime_id !== client.runtimeId) return       // someone else moving
+  if (p.mode === 'teleport' || p.mode === 'reset') {
+    pos = { x: p.position.x, y: p.position.y, z: p.position.z }
+    onGround = p.on_ground
+    return
+  }
+  pos = { x: p.position.x, y: p.position.y, z: p.position.z }
+  onGround = p.on_ground
+  if (p.mode === 'rotation') { yaw = p.yaw; pitch = p.pitch }
+})
+
+client.on('set_entity_motion', (p) =&gt; {
+  if (p.runtime_entity_id !== client.runtimeId) return
+  // server applied velocity — let the correction arrive, don't fight it
+  pos = { x: pos.x + p.velocity.x, y: pos.y + p.velocity.y, z: pos.z + p.velocity.z }
+})
+
+function step (dx, dz) {
+  const from = { ...pos }
+  pos = { x: pos.x + dx, y: pos.y + (jumping ? 0.42 : 0), z: pos.z + dz }
+
+  client.write('player_auth_input', {
+    pitch,
+    yaw,
+    position: pos,
+    move_vector: { x: dx, z: dz },
+    head_yaw: yaw,
+    input_data: jumping ? ['jumping'] : [],
+    input_mode: 'mouse',
+    play_mode: 'normal',
+    interaction_model: 'crosshair',
+    interact_rotation: { x: 0, z: 0 },
+    tick: ticks++,
+    delta: { x: pos.x - from.x, y: pos.y - from.y, z: pos.z - from.z },
+    transaction: undefined,
+    item_stack_request: undefined,
+    block_action: [],
+    vehicle_rotation: undefined,
+    predicted_vehicle: undefined,
+    analogue_move_vector: { x: dx, z: dz },
+    camera_orientation: { x: 0, y: 0, z: 0 },
+    raw_move_vector: { x: dx, z: dz }
+  })
+}
+
+// yaw 0 = +Z, 90 = -X
+function forward (yawDeg) {
+  const r = yawDeg * Math.PI / 180
+  return { x: -Math.sin(r), z: Math.cos(r) }
+}
+
+setInterval(() =&gt; {
+  if (!client.runtimeId) return
+  const f = forward(yaw)
+  step(f.x * WALK, f.z * WALK)
+}, TICK_MS)</code></pre>
+
+    <div class="warn">
+      <p>
+        <b>Verify the yaw convention against the server, not against this page.</b> Send one tick,
+        read the <code>move_player</code> that comes back, and check that the position moved the way
+        you expected. If it goes sideways, your sign is flipped — fix it before building anything
+        on top.
+      </p>
+    </div>
+
+    <h2 id="turns"><span class="n">4.5</span> Turning, looking, jumping</h2>
+
+    <ul>
+      <li><b>Turn</b> by changing <code>yaw</code> and sending the same position — the server replies
+        with <code>mode: rotation</code> when it accepts a pure rotation.</li>
+      <li><b>Jump</b> by including <code>'jumping'</code> in <code>input_data</code> for one tick, and
+        giving <code>position.y</code> a small rise. <code>onGround</code> from the server decides
+        whether the jump is possible.</li>
+      <li><b>Sneak</b> with <code>'sneaking'</code>; <b>sprint</b> is a modifier on your own speed, not
+        a separate packet.</li>
+      <li><b>Swim / fly</b> add <code>ascend</code>/<code>descend</code> and depend on the player's
+        abilities — the server clamps movement it did not grant.</li>
+    </ul>
+
+    <h2 id="alternatives"><span class="n">4.6</span> Other ways to move</h2>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Approach</th><th>How</th><th>Reality check</th></tr></thead>
+        <tbody>
+          <tr><td>Teleport command</td><td><code>command_request</code> with <code>/tp</code></td>
+            <td>Needs operator or a permission-granting addon. Otherwise it just fails.</td></tr>
+          <tr><td>Vehicle</td><td><code>interact</code> on a boat/minecart, then <code>vehicle_rotation</code></td>
+            <td>The server drives the position; you only steer.</td></tr>
+          <tr><td>Knockback</td><td>Take a hit, follow <code>set_entity_motion</code></td>
+            <td>Unreliable and obvious; not a movement system.</td></tr>
+          <tr><td>Fake position only</td><td>Send <code>player_auth_input</code> without a matching tick loop</td>
+            <td>Rubber-band. The server simulates you; it will not accept teleporting without cause.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="risks"><span class="n">4.7</span> Risks and tells</h2>
+
+    <ol class="steps">
+      <li><b>Never moving is a signal.</b> Some anti-bot addons kick clients that spawn and stay
+        still forever; a slow patrol loop is what makes a bot look alive.</li>
+      <li><b>Tick jitter is a signal.</b> <code>setInterval(50)</code> drifts under load. Track the
+        wall clock and send early when behind, but never send two ticks in one millisecond.</li>
+      <li><b>Impossible movement is a signal.</b> Do not scale speed above vanilla, do not fly
+        without abilities, and do not skip collisions — the server checks the same things.</li>
+      <li><b>Position sanity is enforced locally too.</b> This project's anticrash guard drops any
+        inbound packet whose position is NaN or absurd, so a bug in your own position math shows up
+        as missing updates rather than a crash.</li>
+    </ol>
+
+  </main>
+</div>
+
+<footer>
+  <span>§ 04 movement</span>
+  <span class="spacer"></span>
+  <a href="packets.html#packet/player_auth_input">player_auth_input</a>
+  <a href="packets.html#packet/move_player">move_player</a>
+  <a href="auth.html">next: authentication →</a>
+</footer>
+
+<script src="assets/protocol-data.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

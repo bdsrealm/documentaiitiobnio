@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>(function(){try{var t=localStorage.getItem('bd-theme');if(!t){t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}document.documentElement.dataset.theme=t}catch(e){}})()</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Packets · Bedrock protocol notes</title>
+<meta name="description" content="Every Minecraft Bedrock 1.26.60 packet with its full field tree, array fields, mappers and a generated write() skeleton.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="index.html"><span class="mark"></span> bedrock / protocol notes</a>
+  <span class="crumb">§ 02 — <b>Packet reference</b></span>
+  <button class="theme-toggle" id="theme-toggle" type="button" aria-pressed="false">dark</button>
+  <span class="ver" data-version>1.26.60 · proto 2225</span>
+</header>
+
+<div class="shell">
+  <nav class="rail">
+    <div class="rail-head">Contents</div>
+    <ol>
+      <li><a href="index.html"><span class="n">01</span> Overview</a></li>
+      <li><a href="packets.html" class="active"><span class="n">02</span> Packet reference</a></li>
+      <li><a href="messages.html"><span class="n">03</span> Sending messages</a></li>
+      <li><a href="movement.html"><span class="n">04</span> Movement</a></li>
+      <li><a href="auth.html"><span class="n">05</span> Authentication</a></li>
+      <li><a href="nethernet.html"><span class="n">06</span> NetherNet</a></li>
+      <li><a href="engine.html"><span class="n">07</span> bedrockx engine</a></li>
+      <li><a href="rewrite.html"><span class="n">08</span> Rewriting the client</a></li>
+      <li><a href="exploits.html"><span class="n">09</span> Exploits and abuse</a></li>
+      <li><a href="automod.html"><span class="n">10</span> Anticheat and automod</a></li>
+    </ol>
+    <div class="rail-note">
+      Generated from the schema in this repository. Every field name is what the
+      encoder on disk expects.
+    </div>
+  </nav>
+
+  <main class="wide">
+  <section class="browser-intro">
+    <h1>Packet reference</h1>
+    <p class="lede">Every packet this client can encode, straight from the compiled schema.
+      Each entry carries its field tree, its array paths, and — for anything with an array —
+      a recipe for sending it in game.</p>
+  </section>
+
+  <div class="browser">
+
+    <aside class="sidebar">
+      <div class="search-wrap">
+        <input id="search" type="search" placeholder="Search packets…  (/ focuses)" autocomplete="off" spellcheck="false">
+        <div class="filters">
+          <label><input type="checkbox" id="f-arrays"> arrays only</label>
+          <label><input type="checkbox" id="f-known"> direction known</label>
+        </div>
+      </div>
+      <div class="count" id="count">—</div>
+      <div class="packet-list" id="packet-list"></div>
+
+      <div class="search-wrap" style="border-top:1px solid var(--line);border-bottom:0">
+        <input id="type-search" type="search" placeholder="Search reusable types…" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="count">types (<span data-stat="typeCount">—</span>)</div>
+      <div class="packet-list" id="type-list" style="max-height:220px;flex:0 1 auto"></div>
+    </aside>
+
+    <section class="detail" id="detail">
+      <div class="detail-empty">
+        <p>Pick a packet on the left.</p>
+        <p class="small dim">Search by name, id, or <code>0x</code> hex. Press <kbd>/</kbd> to focus the box.</p>
+      </div>
+    </section>
+
+  </div>
+
+  <h2>Notes for sending packets</h2>
+
+  <div class="cols">
+    <div class="card">
+      <h3>Writing</h3>
+      <p class="small muted">Every page's skeleton becomes a real write through the engine adapter:</p>
+      <pre><code>// src/engine/bedrockx.js
+this.client.write('set_time', { time: 0 })</code></pre>
+      <p class="small dim">Failures are caught inside <code>connection.js</code> and printed, not thrown — a malformed
+        payload usually shows up as a stack trace in the bot console and nothing on the wire.</p>
+    </div>
+
+    <div class="card">
+      <h3>Arrays are the expensive part</h3>
+      <p class="small muted">A <code>varint</code> count costs 1–5 bytes and can claim a length the body never
+        delivers; the server reads until EOF. An <code>lu32</code> count is a fixed 4-byte field and is
+        checked more strictly.</p>
+      <p class="small dim">Empty strings and empty NBT compounds cost 1 byte per element, which is why
+        packet floods use them.</p>
+    </div>
+
+    <div class="card">
+      <h3>Direction is not in the schema</h3>
+      <p class="small muted">The compiled JSON drops <code>!bound</code>. The chips on this page are a
+        curated table for well-known packets; <span class="badge unknown">?</span> means unknown.</p>
+      <p class="small dim">For the authoritative per-packet direction, check upstream
+        <code>proto.yml</code> (<code>!bound</code>) or Mojang's generated docs.</p>
+    </div>
+  </div>
+</main>
+</div>
+
+<footer>
+  <span>§ 02 packet reference</span>
+  <span class="spacer"></span>
+  <a href="index.html">overview</a>
+  <a href="messages.html">messages</a>
+  <a href="movement.html">movement</a>
+  <a href="rewrite.html">rewrite</a>
+</footer>
+
+<script src="assets/protocol-data.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

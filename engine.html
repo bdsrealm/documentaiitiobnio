@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>(function(){try{var t=localStorage.getItem("bd-theme");if(!t){t=window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"}document.documentElement.dataset.theme=t}catch(e){}})()</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bedrockx engine · Bedrock protocol notes</title>
+<meta name="description" content="The bedrockx client fork documented end to end: connection state machine, login and ECDH handshake, AES-GCM framing, compression, custom datatypes, the packet API and the relay server.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="index.html"><span class="mark"></span> bedrock / protocol notes</a>
+  <span class="crumb">§ 07 — <b>bedrockx engine</b></span>
+  <button class="theme-toggle" id="theme-toggle" type="button" aria-pressed="false">dark</button>
+
+  <span class="ver" data-version>1.26.60 · proto 2225</span>
+</header>
+
+<div class="shell">
+  <nav class="rail">
+    <div class="rail-head">Contents</div>
+    <ol>
+      <li><a href="index.html"><span class="n">01</span> Overview</a></li>
+      <li><a href="packets.html"><span class="n">02</span> Packet reference</a></li>
+      <li><a href="messages.html"><span class="n">03</span> Sending messages</a></li>
+      <li><a href="movement.html"><span class="n">04</span> Movement</a></li>
+      <li><a href="auth.html"><span class="n">05</span> Authentication</a></li>
+      <li><a href="nethernet.html"><span class="n">06</span> NetherNet</a></li>
+      <li><a href="engine.html" class="active"><span class="n">07</span> bedrockx engine</a></li>
+      <li><a href="rewrite.html"><span class="n">08</span> Rewriting the client</a></li>
+      <li><a href="exploits.html"><span class="n">09</span> Exploits and abuse</a></li>
+      <li><a href="automod.html"><span class="n">10</span> Anticheat and automod</a></li>
+    </ol>
+    <div class="rail-note">
+      Generated from the schema in this repository. Every field name is what the
+      encoder on disk expects.
+    </div>
+  </nav>
+
+  <main>
+
+  <section class="hero">
+    <h1>bedrockx engine</h1>
+    <p class="lede">
+      The patched fork in <code>src/engine/bedrockx-lib/</code>: a from-scratch Bedrock client
+      (protodef + RakNet/WebRTC) wrapped by <code>src/engine/bedrockx.js</code>, the adapter the bot
+      actually calls. Everything on this page is what those files do, in order.
+    </p>
+  </section>
+
+  <div class="stats">
+    <div class="stat"><b>2225</b><span>protocol version</span></div>
+    <div class="stat"><b>1.26.60</b><span>game version</span></div>
+    <div class="stat"><b>5</b><span>client states</span></div>
+    <div class="stat"><b>512</b><span>compression threshold</span></div>
+    <div class="stat"><b>60 s</b><span>spawn timeout</span></div>
+  </div>
+
+  <h2 id="files">1 · What is where</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Path</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>src/engine/bedrockx.js</code></td><td>Adapter: authflow, transport choice, spawn detection, chat/kick events, the write helpers the bot uses.</td></tr>
+        <tr><td><code>bedrockx-lib/createClient.js</code></td><td><code>createClient(options)</code> — delayed init, then connect, then the resource-pack reply.</td></tr>
+        <tr><td><code>bedrockx-lib/client.js</code></td><td>Connection state machine, login JWT, handshake/secret derivation, packet dispatch to events.</td></tr>
+        <tr><td><code>bedrockx-lib/connection.js</code></td><td>Status codes, batch handling, encrypt/decrypt plumbing, <code>write()</code> / <code>sendBuffer()</code>.</td></tr>
+        <tr><td><code>bedrockx-lib/transforms/framer.js</code></td><td>Varint length framing, deflate, batch header, compression byte.</td></tr>
+        <tr><td><code>bedrockx-lib/transforms/serializer.js</code></td><td>protodef compiler → <code>createSerializer()</code> / <code>createDeserializer()</code>.</td></tr>
+        <tr><td><code>bedrockx-lib/transforms/encryption.js</code></td><td>AES-256-GCM keystream, SHA-256 checksums, counters.</td></tr>
+        <tr><td><code>bedrockx-lib/datatypes/minecraft.js</code></td><td>Hand-written types: <code>uuid</code>, <code>nbt</code>, <code>lnbt</code>, <code>entityMetadataLoop</code>, <code>ipAddress</code>, <code>endOfArray</code>.</td></tr>
+        <tr><td><code>bedrockx-lib/protocol/protocol.json</code></td><td>444 types, 254 packets, the id mapper. Source of the <a href="packets.html">packets page</a>.</td></tr>
+        <tr><td><code>bedrockx-lib/rak.js</code> + <code>raknet/</code></td><td>RakNet transport over the native <code>raknet.node</code> binding.</td></tr>
+        <tr><td><code>bedrockx-lib/nethernet/</code></td><td>WebRTC transport — see the <a href="nethernet.html">NetherNet page</a>.</td></tr>
+        <tr><td><code>bedrockx-lib/server*.js</code>, <code>relay.js</code></td><td>A server and a non-transparent proxy built on the same serializer.</td></tr>
+        <tr><td><code>bedrockx-lib/skins/steve.json</code></td><td>Default skin payload spread into <code>login</code>.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="states">2 · State machine</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Status</th><th>Entered when</th></tr></thead>
+      <tbody>
+        <tr><td><span class="badge id">0</span></td><td><code>Disconnected</code></td><td>Initial value; set again by <code>close()</code>.</td></tr>
+        <tr><td><span class="badge id">1</span></td><td><code>Connecting</code></td><td>Transport reports <code>onConnected</code> → <code>request_network_settings</code> is written.</td></tr>
+        <tr><td><span class="badge id">2</span></td><td><code>Authenticating</code></td><td><code>sendLogin()</code> runs, right after <code>network_settings</code>.</td></tr>
+        <tr><td><span class="badge id">3</span></td><td><code>Initializing</code></td><td><code>server_to_client_handshake</code> handled and <code>client_to_server_handshake</code> answered.</td></tr>
+        <tr><td><span class="badge id">4</span></td><td><code>Initialized</code></td><td>Spawn confirmed (see §6).</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="handshake">3 · Handshake, packet by packet</h2>
+
+  <div class="flow"><span class="c">createClient(opts)</span>
+  ├─ new Client({ delayedInit: true })   <span class="c">← keys are generated in init()</span>
+  ├─ authenticate()                       <span class="c">prismarine-auth, sisu flow</span>
+  ├─ transport select
+  │    DEFAULT              → RakClient,   batchHeader = <span class="y">0xfe</span>, AES <span class="g">on</span>
+  │    NETHERNET[_JSONRPC]  → NetherNet,   batchHeader = <span class="y">null</span>, AES <span class="y">off</span>
+  └─ emit('connect_allowed') → connect()
+        │
+        ▼  transport connected
+   <span class="p">request_network_settings</span> { client_protocol: 2225 }
+        │
+        ▼
+   <span class="p">network_settings</span> { compression_algorithm, compression_threshold }
+        │   compressor + threshold applied to the framer
+        ▼
+   <span class="p">login</span>  tokens.identity = JWT { AuthenticationType: 0, Certificate: {chain:[]}, Token }
+          tokens.client   = JWT(ES384, header.x5u = P-384 public key) over the skin/device payload
+        │
+        ▼
+   <span class="p">server_to_client_handshake</span> { token }   <span class="c">"header.payload"</span>
+        │   secret = SHA-256( salt ‖ ECDH(P-384 private, server x5u) )
+        │   startEncryption(secret[0..16])   <span class="c">DEFAULT only</span>
+        ▼
+   <span class="p">client_to_server_handshake</span> {}
+        │
+        ▼
+   <span class="p">play_status</span> login_success → status Initializing
+        │
+        ▼
+   <span class="p">resource_packs_info</span> → respond <span class="p">resource_pack_client_response</span> completed
+                            + <span class="p">request_chunk_radius</span> { 16, max_radius 8 }
+        │
+        ▼
+   <span class="p">start_game</span> → <span class="p">serverbound_loading_screen</span>{type:2}
+                 <span class="p">request_chunk_radius</span>{16,8}
+                 <span class="p">set_local_player_as_initialized</span>{runtime_entity_id}
+        │
+        ▼
+   <span class="g">spawned</span> = true → engine.connect() resolves</div>
+
+  <h3>Why the start_game acks matter</h3>
+
+  <p>
+    Realms drop a client roughly <b>8 seconds</b> after <code>start_game</code> unless it confirms it
+    reached the world. <code>bedrockx.js</code> sends <code>serverbound_loading_screen</code>
+    (<code>type: 2</code>), <code>request_chunk_radius</code> and
+    <code>set_local_player_as_initialized</code> — the runtime entity id comes from
+    <code>start_game.runtime_entity_id</code>. Without that trio, spawn never completes and the
+    connect promise only ends at the 60 s timeout.
+  </p>
+
+  <h2 id="encryption">4 · Encryption (DEFAULT transport only)</h2>
+
+  <pre><code>secret  = SHA-256( Buffer.from(payload.salt, 'base64')
+                 ‖ ECDH(clientPrivate, serverPublicFromHeader.x5u) )
+
+key     = secret[0..32]        // AES-256
+iv      = secret[0..12]        // taken from the same bytes
+cipher  = aes-256-gcm, stream mode — updated per batch
+
+frame   = [0x00][deflateRaw(batch)]     // or [0xff][batch] when under threshold
+checksum= SHA-256( LE64(counter) ‖ frame ‖ secret )[0..8]
+wire    = AES(frame ‖ checksum)         // counter increments per batch, per direction</code></pre>
+
+  <p class="small muted">
+    The GCM tag is not used; the 8-byte SHA-256 checksum is the integrity check. Receiving verifies it
+    against a separate <code>receiveCounter</code> and disconnects with
+    <code>disconnectionScreen.badPacket</code> on mismatch.
+  </p>
+
+  <div class="warn">
+    <b>Counters are state, not per-packet.</b> One dropped or duplicated batch desynchronises
+    <code>sendCounter</code> / <code>receiveCounter</code> permanently — every later frame fails its
+    checksum. Any code path that bypasses <code>sendMCPE()</code> must not touch the cipher.
+  </div>
+
+  <p class="small muted">
+    Over NetherNet both directions skip this entirely: <code>disableEncryption = true</code>, and the
+    framer writes no compression byte until <code>compressionReady</code>. DTLS secures the channel.
+  </p>
+
+  <h2 id="framing">5 · Framing and compression</h2>
+
+  <pre><code>batch    = [0xfe]                      // DEFAULT only
+         + concat( varint(len) + packet … )
+         + compression?
+             compressor byte 0x00 (deflate) when len &gt; threshold (512)
+             compressor byte 0xff (none)   otherwise, if features.compressorInHeader
+body     = deflateRaw(batch) when compressing
+
+one write() = one batch = one sendReliable(..., immediate)
+                 RakNet: RELIABLE_ORDERED, IMMEDIATE priority
+             NetherNet: ReliableDataChannel</code></pre>
+
+  <div class="note">
+    <b>There is no write coalescing.</b> Each <code>write()</code> serialises, frames, compresses and
+    hands one buffer to the transport immediately. That is exactly what makes packet floods possible
+    (<code>setInterval(…, 0)</code> really does produce thousands of sends per second) — and it is
+    also why a flood needs a pre-built payload instead of re-serialising a million-element array on
+    every tick.
+  </div>
+
+  <h2 id="datatypes">6 · Serializer and custom types</h2>
+
+  <p>
+    <code>transforms/serializer.js</code> compiles <code>protocol.json</code> plus
+    <code>datatypes/compiler-minecraft.js</code> with <code>ProtoDefCompiler</code> and exposes the
+    root type <code>mcpe_packet</code>:
+  </p>
+
+  <pre><code>const { createSerializer, createDeserializer } = require('./transforms/serializer')
+
+const ser = createSerializer()
+const buf = ser.createPacketBuffer({ name: 'login', params: { … } })  // id + body
+
+client.write('login', { … })      // same thing, then frame + send
+client.on('text', (params) =&gt; …)  // deserialized params of one packet</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Encoding</th></tr></thead>
+      <tbody>
+        <tr><td><code>uuid</code></td><td>16 raw bytes (uuid-1345). Not a string on the wire.</td></tr>
+        <tr><td><code>nbt</code></td><td>Little-endian NBT with varint lengths (network NBT).</td></tr>
+        <tr><td><code>lnbt</code></td><td>Little-endian NBT with fixed widths; an <code>end</code> tag costs exactly 1 byte.</td></tr>
+        <tr><td><code>entityMetadataLoop</code></td><td>Repeated key/value entries until <code>endVal</code>.</td></tr>
+        <tr><td><code>ipAddress</code></td><td>Four raw bytes, dotted on the wire as text only in logs.</td></tr>
+        <tr><td><code>endOfArray</code></td><td>Reads to EOF — no count prefix at all.</td></tr>
+        <tr><td><code>mapper</code></td><td>Numeric id ↔ name; either side accepted when writing.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="warn">
+    <b><code>ShieldItemID</code> is a compile-time variable.</b> Some item stacks encode differently when
+    they are a shield, and the runtime id is only known after <code>item_registry</code> arrives.
+    <code>client.js</code> (and the relay) call
+    <code>proto.setVariable('ShieldItemID', state.runtime_id)</code> for
+    <code>minecraft:shield</code>. Send item stacks before that point and they encode wrong.
+  </div>
+
+  <h2 id="api">7 · Packet API and command origins</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method on the adapter</th><th>Sends</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>say(message)</code></td><td><code>text</code> (<code>type: 'chat'</code>)</td><td>Normal chat, authored by the account.</td></tr>
+        <tr><td><code>command(cmd)</code></td><td><code>command_request</code>, origin <code>player</code></td><td>Resolves from <code>command_output</code> matched by <code>request_id</code>; 10 s timeout resolves "(no output)".</td></tr>
+        <tr><td><code>externalCommand(cmd)</code></td><td><code>command_request</code>, origin <code>automationplayer</code></td><td>Realm renders it as <code>* External …</code>. Fixed nil uuid.</td></tr>
+        <tr><td><code>externalCommandRandom(cmd)</code></td><td>same, fresh uuid + request id per send</td><td>Used by <code>spam</code> so the realm cannot collapse repeats.</td></tr>
+        <tr><td><code>playerAction(action, pos, face)</code></td><td><code>player_action</code></td><td>Swing/stop/mine; used by the <code>break</code> flood.</td></tr>
+        <tr><td><code>eatBite()</code></td><td><code>entity_event</code> <code>eating_item</code></td><td>Data is a random 15–30 M counter, as vanilla sends.</td></tr>
+        <tr><td><code>rawWrite(name, data)</code></td><td>whatever you pass</td><td>Escape hatch: <code>client.write(name, data)</code>.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre><code>// command_request shape (origin drives how the realm attributes it)
+client.write('command_request', {
+  command: '/me hello',
+  origin: {
+    type: 'automationplayer',          // 'player' | 'automationplayer'
+    uuid: randomUUID(),
+    request_id: randomUUID(),
+    player_entity_id: this.runtimeId ?? 0n
+  },
+  internal: false,
+  version: 'latest'
+})</code></pre>
+
+  <p class="small muted">
+    <code>internal: true</code> keeps the command server-side (no <code>* External …</code> line in
+    chat). Everything else about the payload is identical.
+  </p>
+
+  <h2 id="spawn">8 · Spawn detection and early hooks</h2>
+
+  <dl class="kv">
+    <dt><code>loginAccepted</code></dt><dd>set on <code>play_status: login_success</code> and on <code>start_game</code> — the earliest point a write is safe.</dd>
+    <dt><code>spawned</code></dt><dd>set on <code>start_game</code> or <code>play_status: player_spawn</code>; gates every normal command.</dd>
+    <dt><code>onConnectedEarly()</code></dt><dd>fired once at <code>login_success</code>, before the world loads — the hook the early floods use.</dd>
+    <dt><code>runtimeId</code></dt><dd><code>start_game.runtime_entity_id</code>; required by <code>eatBite</code> and used in origins.</dd>
+    <dt><code>seed</code>, <code>startGame</code></dt><dd>kept for the <code>seed</code> command and anything that reads world metadata.</dd>
+    <dt>timeout</dt><dd>60 s from <code>connect()</code> to spawn, else the promise rejects.</dd>
+  </dl>
+
+  <h2 id="transports">9 · RakNet vs NetherNet</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>DEFAULT</code> (RakNet)</th><th><code>NETHERNET</code></th></tr></thead>
+      <tbody>
+        <tr><td>Batch header</td><td><code>0xfe</code></td><td>none</td></tr>
+        <tr><td>Bedrock AES layer</td><td>yes (counter + checksum)</td><td>no — DTLS</td></tr>
+        <tr><td>Compression byte</td><td>after encryption is negotiated</td><td>always, once <code>compressionReady</code></td></tr>
+        <tr><td>Reliability</td><td><code>RELIABLE_ORDERED</code>, immediate priority</td><td>ordered data channel</td></tr>
+        <tr><td>Implementation</td><td>native <code>raknet.node</code>, protocol version 11</td><td><code>@roamhq/wrtc</code> + signalling</td></tr>
+        <tr><td>Typical use</td><td>resolved realm address, LAN, BDS</td><td>Realms, cross-network play</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="relay">10 · Server and relay</h2>
+
+  <p>
+    <code>server.js</code> / <code>serverPlayer.js</code> implement a listener that accepts Bedrock
+    clients; <code>relay.js</code> extends it into a proxy: on a player's <code>login</code> it opens an
+    upstream <code>Client</code> to the real destination, then forwards packets both ways.
+  </p>
+
+  <ul class="small">
+    <li><code>client_cache_status { enabled: false }</code> is sent upstream so the backend does not expect a client cache.</li>
+    <li><code>level_chunk</code> packets that arrive before <code>start_game</code> are buffered and flushed after it.</li>
+    <li><code>item_registry</code> is sniffed to set <code>ShieldItemID</code> on both serializer and deserializer.</li>
+    <li><code>update_player_game_type</code> addressed to the relayed player is rewritten to <code>set_player_game_type</code>.</li>
+    <li><code>play_status: login_success</code> from upstream is swallowed — the local client already handled its own login.</li>
+    <li>Handlers can <code>des.canceled = true</code> / <code>des.modified = true</code> to drop or re-serialise a packet.</li>
+  </ul>
+
+  <h2 id="auth">11 · Authentication</h2>
+
+  <p>
+    Tokens come from prismarine-auth's <code>sisu</code> flow. The fork prefers its own nested copy
+    (<code>node_modules/bedrockx/node_modules/prismarine-auth</code>) and falls back to the project's.
+    Device spoofing (<code>devicewoof</code>) sets both the auth title (default
+    <code>Titles.MinecraftIOS</code>, <code>deviceType: 'iOS'</code>) and the
+    <code>DeviceOS</code> in the login payload — the server compares them, so changing one alone
+    gets the login rejected.
+  </p>
+
+  <dl class="kv">
+    <dt><code>getMinecraftBedrockServicesToken()</code></dt><dd>the <code>mcToken</code> used as the signalling <code>Authorization</code> header and inside the WebRTC identity assertion.</dd>
+    <dt><code>token</code></dt><dd>raw Xbox token placed in <code>login.tokens.identity</code>.</dd>
+    <dt><code>tokenData.mid</code></dt><dd>used to build <code>SkinId</code> / PlayFab ids in the login JWT.</dd>
+    <dt><code>clientX509</code></dt><dd>P-384 public key, base64 DER SPKI, published as the JWT <code>x5u</code> header.</dd>
+  </dl>
+
+  <h2 id="debug">12 · Debugging checklist</h2>
+
+  <ol class="steps">
+    <li><b>Nothing on the wire at all</b> — check <code>spawned</code> / <code>loginAccepted</code>; most
+      write helpers throw before that, and <code>connection.write()</code> swallows serializer errors
+      with a <code>console.log</code>.</li>
+    <li><b>Kicked right after join</b> — the start_game acks did not land, or the device/auth-title
+      pair mismatches.</li>
+    <li><b><code>Checksum mismatch</code></b> — counter drift on the DEFAULT transport; reconnect, do not retry.</li>
+    <li><b>Parse error loop</b> — a schema mismatch: the server sent a packet id whose body this
+      <code>protocol.json</code> cannot read. <code>isParseError()</code> downgrades these to debug logs.</li>
+    <li><b>Realm joins but the world never loads</b> — resource pack reply or chunk radius never sent;
+      both are automatic in <code>createClient()</code>.</li>
+    <li><b>Spam/flood sends nothing</b> — the transport is up but the bot is not spawned; early
+      floods must use the <code>loginAccepted</code> hook, not <code>spawned</code>.</li>
+  </ol>
+
+  <div class="note">
+    Payloads for floods live in <code>src/bot.js</code> (<code>PACKET_FLOOD_SPECS</code> /
+    <code>packetFloodSend</code>). Browse the arrays they use on the
+    <a href="packets.html">packets page</a> — every field name there is exactly what this serializer
+    expects.
+  </div>
+
+</main>
+</div>
+
+<footer>
+  <span>§ 07 bedrockx engine</span>
+  <span class="spacer"></span>
+  <a href="packets.html">packets</a>
+  <a href="nethernet.html">nethernet</a>
+  <a href="rewrite.html">next: rewrite →</a>
+</footer>
+
+<script src="assets/protocol-data.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

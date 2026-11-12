@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>(function(){try{var t=localStorage.getItem('bd-theme');if(!t){t=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}document.documentElement.dataset.theme=t}catch(e){}})()</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rewriting the client · Bedrock protocol notes</title>
+<meta name="description" content="Design notes for a better Bedrock client: transport and codec interfaces, correct crypto, batched framing, a tick loop, versioning and how to test it.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="index.html"><span class="mark"></span> bedrock / protocol notes</a>
+  <span class="crumb">§ 08 — <b>Rewriting the client</b></span>
+  <button class="theme-toggle" id="theme-toggle" type="button" aria-pressed="false">dark</button>
+  <span class="ver">1.26.60 · proto 2225</span>
+</header>
+
+<div class="shell">
+  <nav class="rail">
+    <div class="rail-head">Contents</div>
+    <ol>
+      <li><a href="index.html"><span class="n">01</span> Overview</a></li>
+      <li><a href="packets.html"><span class="n">02</span> Packet reference</a></li>
+      <li><a href="messages.html"><span class="n">03</span> Sending messages</a></li>
+      <li><a href="movement.html"><span class="n">04</span> Movement</a></li>
+      <li><a href="auth.html"><span class="n">05</span> Authentication</a></li>
+      <li><a href="nethernet.html"><span class="n">06</span> NetherNet</a></li>
+      <li><a href="engine.html"><span class="n">07</span> bedrockx engine</a></li>
+      <li><a href="rewrite.html" class="active"><span class="n">08</span> Rewriting the client</a></li>
+      <li><a href="exploits.html"><span class="n">09</span> Exploits and abuse</a></li>
+      <li><a href="automod.html"><span class="n">10</span> Anticheat and automod</a></li>
+    </ol>
+    <div class="rail-note">
+      Written as a critique of the code in this repository, by someone who has read it
+      line by line. The point is not to start over for its own sake — it is to know which
+      decisions are load-bearing.
+    </div>
+  </nav>
+
+  <main>
+
+    <section class="hero">
+      <p class="eyebrow">Chapter eight</p>
+      <h1>Rewriting the client</h1>
+      <p class="lede">
+        A Bedrock client is five small programs wearing one trench coat: an authenticator, a
+        transport, a codec, a session state machine and a tick loop. Most of the pain in this
+        codebase comes from those five things living inside one 215-line class.
+      </p>
+    </section>
+
+    <h2 id="layers"><span class="n">8.1</span> Five layers, five contracts</h2>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Layer</th><th>Owns</th><th>Must not know about</th></tr></thead>
+        <tbody>
+          <tr><td>Auth</td><td>Xbox tokens, Bedrock session, key pair</td><td>packets, sockets</td></tr>
+          <tr><td>Transport</td><td>ordering, reliability, MTU, reconnects</td><td>Bedrock packet names</td></tr>
+          <tr><td>Codec</td><td>bytes ⇄ <code>{ name, params }</code></td><td>sockets, auth, timing</td></tr>
+          <tr><td>Session</td><td>state machine, handshake, crypto, spawn</td><td>how the UI works</td></tr>
+          <tr><td>Tick</td><td>20 Hz loop, input, movement, batching</td><td>transport internals</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The interfaces are small enough that they fit on one screen, which is the test: if a layer
+      needs four callbacks into another, they are the same layer.
+    </p>
+
+    <pre><code>// transport: bytes in, bytes out, one lifecycle
+interface Transport {
+  connect(): Promise&lt;void&gt;
+  send(buf: Buffer): void                 // one Bedrock batch
+  on(event: 'message' | 'close' | 'error'): void
+  close(reason?: string): void
+}
+
+// codec: version-pinned, stateless, no global mutable state
+interface Codec {
+  encode(name: string, params: object): Buffer
+  decode(buf: Buffer): { name: string, params: object }
+  ids: Map&lt;string, number&gt;
+}
+
+// crypto: one object per direction, explicit counters
+interface Cipher {
+  seal(plaintext: Buffer): Buffer
+  open(ciphertext: Buffer): Buffer        // throws on tamper
+}</code></pre>
+
+    <h2 id="dontcopy"><span class="n">8.2</span> What not to copy from this code</h2>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Decision</th><th>Why it hurts</th><th>Better</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>AES-GCM used as a keystream, integrity from a truncated SHA-256 counter checksum</td>
+            <td>The GCM tag is never written or checked; the checksum is custom and both ends must agree on counter state forever.</td>
+            <td>Pick one real construction and use it fully — GCM with its tag, or the CFB8 + checksum scheme the vanilla client uses. Do not hybridise.</td>
+          </tr>
+          <tr>
+            <td>Static key for NetherNet discovery (<code>SHA-256(LE64(0xdeadbeef))</code>)</td>
+            <td>No secrecy, no authentication — it only stops casual sniffing.</td>
+            <td>Fine for LAN beaconing if documented as obfuscation; never used as the security boundary (DTLS is). Say so in the code comment.</td>
+          </tr>
+          <tr>
+            <td>Every <code>write()</code> becomes its own batch and its own transport send</td>
+            <td>A flood of 1 000 small packets becomes 1 000 frames, each with its own compression and header. Also no backpressure.</td>
+            <td>Queue packets, flush once per tick or at a size cap, expose an explicit <code>flush()</code>.</td>
+          </tr>
+          <tr>
+            <td>Codec state in a global variable (<code>ShieldItemID</code>)</td>
+            <td>Two clients in one process share it; item stacks encode differently depending on who joined last.</td>
+            <td>Pass learned ids into the codec instance; build a codec per session.</td>
+          </tr>
+          <tr>
+            <td>Version constants repeated in three files</td>
+            <td>Upgrading is a scavenger hunt, and a partial bump produces unreadable parse errors.</td>
+            <td>One version manifest per protocol release; the codec and the login payload read from it.</td>
+          </tr>
+          <tr>
+            <td>Filtering WebRTC answers with a patch in the peer (<code>connectionId</code> compare)</td>
+            <td>Correct, but it lives at the wrong layer: the signalling client should only deliver messages addressed to its own connection.</td>
+            <td>Route by <code>connectionId</code> in the signalling layer; keep the peer dumb.</td>
+          </tr>
+          <tr>
+            <td><code>write()</code> catches serializer errors and logs them</td>
+            <td>Callers believe a packet was sent when it was not. This is the single most common "nothing happened" bug.</td>
+            <td>Throw, or return a result object. Let the loop decide whether a bad payload is fatal.</td>
+          </tr>
+          <tr>
+            <td>One class doing auth, socket, codec and handshake</td>
+            <td>Cannot test the handshake without a network, cannot swap transport without touching crypto.</td>
+            <td>Compose the five layers; test each against a fake of the one below.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="session"><span class="n">8.3</span> A session that is a state machine, not a pile of callbacks</h2>
+
+    <pre><code>const State = {
+  idle: 0, connecting: 1, authed: 2, spawned: 3, closed: 4
+}
+
+class Session {
+  #state = State.idle
+  #pending = []
+
+  transition (next, why) {
+    if (next === this.#state) return
+    const prev = this.#state
+    this.#state = next
+    this.emit('state', { prev, next, why })
+
+    if (next === State.authed) this.flushPending()
+    if (next === State.spawned) this.startTick()
+    if (next === State.closed) this.stopTick()
+  }
+
+  // writes are refused, not silently dropped, before the state allows them
+  write (name, params) {
+    if (this.#state &lt; State.authed) throw new Error(`write ${name} before authed`)
+    this.codec.encode(name, params)   // throws on a bad payload
+    this.transport.send(this.framer.add(name, params))
+  }
+}</code></pre>
+
+    <p class="small muted">
+      Note the difference from this codebase: early writes are an error instead of a queue that
+      nobody drains, and the parser exception is not swallowed inside the send path.
+    </p>
+
+    <h2 id="framing"><span class="n">8.4</span> Batches at tick rate, not per packet</h2>
+
+    <pre><code>class Framer {
+  constructor ({ threshold = 512, level = 6, header = 0xfe } = {}) {
+    this.threshold = threshold
+    this.level = level
+    this.header = header
+    this.pending = []
+  }
+
+  add (encoded) { this.pending.push(encoded) }        // varint-length-prefixed
+
+  flush () {
+    if (!this.pending.length) return null
+    const body = Buffer.concat(this.pending)
+    this.pending.length = 0
+
+    const compressed = body.length &gt; this.threshold
+    const payload = compressed ? deflateRaw(body, this.level) : body
+    const compressionByte = compressed ? 0x00 : 0xff
+
+    return Buffer.concat([Buffer.from([this.header, compressionByte]), payload])
+  }
+}</code></pre>
+
+    <p>
+      Two rules make this safe: a packet is never split across flushes, and the flush never exceeds
+      the transport's MTU budget. On RakNet that budget is ~1400 bytes per datagram after headers;
+      on NetherNet it is the 50 000-byte data-channel segment.
+    </p>
+
+    <div class="note">
+      <p>
+        Compression happens <em>after</em> concatenation, which is the whole point: twenty chat
+        lines compress together far better than twenty individual frames. The current code
+        compresses every frame on its own.
+      </p>
+    </div>
+
+    <h2 id="codec"><span class="n">8.5</span> Codec: generated, pinned, replaceable</h2>
+
+    <p>
+      The best decision in the existing code is compiling <code>protocol.json</code> with protodef
+      instead of hand-writing encoders. Keep that, and make the version explicit:
+    </p>
+
+    <pre><code>protocols/
+  1.26.60/
+    schema.json          # 444 types, 254 packets, id mapper
+    codec.ts             # generated: encode/decode + name↔id tables
+    manifest.json        # { gameVersion, protocolVersion, sha256(schema) }
+  index.ts               # registry: protocolFor('1.26.60') → codec
+
+// one codec per session, no globals
+const codec = protocolFor(manifest.gameVersion).createCodec({ variables: {} })
+codec.setVariable('ShieldItemID', 355)</code></pre>
+
+    <p>
+      Generated code can also expose per-packet TypeScript types and a
+      <code>requiredFields(name)</code> helper — which is what turns "packet silently ignored" into
+      a compile error or a clear runtime message.
+    </p>
+
+    <h2 id="tick"><span class="n">8.6</span> The tick loop is a first-class component</h2>
+
+    <pre><code>class Loop {
+  constructor (session, { hz = 20 } = {}) {
+    this.period = 1000 / hz
+    this.tick = 0n
+    this.drift = 0
+    this.session = session
+  }
+
+  start () {
+    this.next = performance.now()
+    this.timer = setInterval(() =&gt; this.run(), this.period / 2)  // check at 2× rate
+  }
+
+  run () {
+    const now = performance.now()
+    if (now &lt; this.next) return
+    this.drift = now - this.next
+    this.next += this.period
+
+    if (this.drift &gt; this.period * 2) this.next = now + this.period  // stop spiralling
+
+    this.session.onTick(this.tick++)   // input → player_auth_input → flush
+  }
+
+  stop () { clearInterval(this.timer) }
+}</code></pre>
+
+    <p class="small muted">
+      A 2× interval check keeps the loop from drifting without ever sending two ticks in the same
+      millisecond. If you want exactness, drive the loop from the socket's event loop and use
+      <code>tick_sync</code> to measure the error.
+    </p>
+
+    <h2 id="testing"><span class="n">8.7</span> How you know it works</h2>
+
+    <ol class="steps">
+      <li><b>Golden vectors.</b> Encode a known packet, compare against a stored hex fixture. This is
+        the only way to catch a field order change after a version bump.</li>
+      <li><b>Round-trip corpus.</b> Record real packets from a join, decode → encode → decode, and
+        require byte equality. Catches mapper and NBT mistakes that a spec reading will not.</li>
+      <li><b>Loopback server.</b> The engine ships a server implementation; run client against it in
+        CI with a fake auth. The full handshake, encryption and spawn sequence then take
+        milliseconds instead of a realm join.</li>
+      <li><b>Fuzz the codec.</b> Random buffers into the parser must produce parse errors, never
+        crashes or unbounded allocations. This is exactly what the anticrash guard exists because
+        of.</li>
+      <li><b>Two clients, one account.</b> The NetherNet signalling fan-out bug only appears with
+        concurrent connections. Make that a test, not a bug report.</li>
+      <li><b>Version matrix.</b> Keep at least one older schema and assert that a mismatched
+        protocol version fails at login with a readable error, not a parse storm.</li>
+    </ol>
+
+    <h2 id="perf"><span class="n">8.8</span> Performance, measured not guessed</h2>
+
+    <p>
+      There are no benchmark numbers on this page on purpose. If you rewrite for speed, measure
+      these five things first, because they are where the time goes:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Metric</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>batches/sec and bytes/packet</td><td>Per-write batching shows up immediately as a 2–5× byte overhead on small packets.</td></tr>
+          <tr><td>GC time under a flood</td><td>Every <code>Buffer.concat</code> allocates; a 1 MB payload rebuilt per tick is a GC benchmark in disguise.</td></tr>
+          <tr><td>compress/decompress time per batch</td><td>Deflate dominates once batches are large; level 6 is not always the right trade.</td></tr>
+          <tr><td>codec compile time at startup</td><td>Protodef compilation is not free; it belongs at build time, not per client.</td></tr>
+          <tr><td>tick jitter (p50/p99)</td><td>The number that decides whether the server believes you are a player.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="migration"><span class="n">8.9</span> A migration order that does not break the bot</h2>
+
+    <ol class="steps">
+      <li>Extract the codec behind a factory first. No behaviour change, but it kills the global
+        <code>ShieldItemID</code> and gives you a place to pin versions.</li>
+      <li>Add the batching framer with a flag. Measure bytes/sec before and after; keep the
+        per-write path until the numbers agree.</li>
+      <li>Move signalling routing into the signalling client, then delete the answer-filter patch.</li>
+      <li>Replace the write-error swallow with a thrown error, and fix the call sites the compiler
+        or tests point at.</li>
+      <li>Add the tick loop and movement as new modules — nothing else needs to know about them.</li>
+      <li>Only then split the session class into auth / session / transport files.</li>
+      <li>Keep the old client runnable until the new one passes the loopback + corpus suite; two
+        transports are cheap, two half-working clients are not.</li>
+    </ol>
+
+    <div class="warn">
+      <p>
+        None of this changes the account rules. A better client is still a client: on realms you do
+        not own or have permission to automate, using it is a ban risk and, in most cases, a terms
+        of service violation. Build against your own server first.
+      </p>
+    </div>
+
+  </main>
+</div>
+
+<footer>
+  <span>§ 08 rewriting the client</span>
+  <span class="spacer"></span>
+  <a href="engine.html">engine internals</a>
+  <a href="nethernet.html">nethernet</a>
+  <a href="index.html">back to contents ↑</a>
+</footer>
+
+<script src="assets/protocol-data.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
